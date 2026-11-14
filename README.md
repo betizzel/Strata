@@ -1,3 +1,10 @@
+> **This fork (branch `m5pro-iq3s`)** tunes the Metal engine for Qwen3.8-Flash-Next IQ3_S on a 48 GB Apple Silicon Mac,
+> where the experts stream from the SSD: direct (uncached) expert reads, a memory fix that really frees 6.2 GB of unused
+> weight copies, an arena wired while it fills, prompt buffers inside the arena and a GPU keep-warm. On an M5 Pro (48 GB)
+> decode went from 20.1 to 31.4 tok/s with identical tokens. Details: [docs/MAC.md](docs/MAC.md#streaming-speed-work-same-mac-2026-11-13).
+> Files, configuration and setup scripts: [baytizzel/Qwen3.8-Flash-Next-IQ3_S-Strata-M5Pro-48gb](https://huggingface.co/baytizzel/Qwen3.8-Flash-Next-IQ3_S-Strata-M5Pro-48gb)
+> on Hugging Face. Upstream: [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
