@@ -55,8 +55,6 @@ ExpertStream::~ExpertStream() {
     cv_.notify_all();
     for (auto& t : io_) t.join();
     if (fd_ >= 0) ::close(fd_);
-    if (fd_c_ >= 0) ::close(fd_c_);
-    if (cfd_c_ >= 0) ::close(cfd_c_);
     if (trace_) std::fclose(trace_);
 }
 
@@ -65,12 +63,6 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
     if (fd_ < 0) { err = "metal stream: cannot open " + f.path; return false; }
     fcntl(fd_, F_NOCACHE, 1);
     fcntl(fd_, F_RDAHEAD, 0);
-    page_cache_ = std::max(0, std::min(2, env_int("STRATA_METAL_PAGE_CACHE", 0)));
-    if (page_cache_ > 0) {   // the same file through the page cache (no read-ahead: the reads are whole experts)
-        fd_c_ = ::open(f.path.c_str(), O_RDONLY);
-        if (fd_c_ < 0) { err = "metal stream: cannot open " + f.path; return false; }
-        fcntl(fd_c_, F_RDAHEAD, 0);
-    }
     if (const char* tp = std::getenv("STRATA_METAL_ROUTE_TRACE"); tp && *tp) {
         trace_ = std::fopen(tp, "wb");
         if (!trace_) { err = std::string("metal stream: cannot write the route trace ") + tp; return false; }
@@ -126,20 +118,12 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
             cfd_ = cfd;
             coff_ = off;
             std::fprintf(stderr, "strata metal stream: experts read from %s (one request per expert)\n", cp.c_str());
-            if (page_cache_ > 0) {
-                cfd_c_ = ::open(cp.c_str(), O_RDONLY);
-                if (cfd_c_ >= 0) fcntl(cfd_c_, F_RDAHEAD, 0);
-            }
         } else if (cfd >= 0) {
             ::close(cfd);
             std::fprintf(stderr, "strata metal stream: %s is not this GGUF's (sizes or bytes differ): the GGUF is read\n",
                          cp.c_str());
         }
     }
-    if (page_cache_ > 0)
-        std::fprintf(stderr, "strata metal stream: %s read through the file cache (STRATA_METAL_PAGE_CACHE=%d): experts macOS "
-                             "still holds are copied from memory, not read from the SSD\n",
-                     page_cache_ == 1 ? "decode misses and read-aheads are" : "all expert reads are", page_cache_);
     // size classes: one LRU pool per class.  The layers' slot sizes (9 in the IQ3_XXS mix) are merged into a few
     // classes, each as big as its largest member, so that no member wastes more than STRATA_METAL_CLASS_WASTE (default
     // 0.15) of its slot: every class must hold a whole layer's experts for a prompt chunk, so fewer classes = less
@@ -316,10 +300,9 @@ int ExpertStream::victim(int ci) {
 // One piece of an expert: slice part / split_ (gate, up, down), piece part % split_ of it.  The pieces of one expert
 // go to several I/O threads, so a single miss is read with several requests in flight (its latency, not only the
 // SSD's throughput, is what a layer waits for).
-void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
+void ExpertStream::read_part(int s, int l, int e, int part) {
     const Lay& x = lay_[(size_t) l];
     if (cfd_ >= 0) {   // the contiguous copy: the whole expert, piece part of split_ (the slot keeps gate | up | down)
-        const int fd = cache && cfd_c_ >= 0 ? cfd_c_ : cfd_;
         const uint64_t len = x.gs + x.us + x.ds, src = coff_[(size_t) l] + (uint64_t) e * len;
         const uint64_t a = len * (uint64_t) part / (uint64_t) split_ / 4096 * 4096;
         const uint64_t b = part + 1 == split_ ? len : len * (uint64_t) (part + 1) / (uint64_t) split_ / 4096 * 4096;
@@ -331,7 +314,7 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
         // instead.  Here the read is widened to whole pages into this thread's bounce buffer (true direct I/O, nothing
         // cached), and the expert's bytes are copied into the slot.
         static const bool direct = env_int("STRATA_METAL_DIRECT", 0) != 0;
-        if (direct && fd == cfd_ && ((o | n) & (PAGE - 1)) != 0) {
+        if (direct && ((o | n) & (PAGE - 1)) != 0) {
             thread_local uint8_t* bounce = nullptr;
             thread_local uint64_t bounce_cap = 0;
             const uint64_t a0 = o / PAGE * PAGE, a1 = (o + n + PAGE - 1) / PAGE * PAGE;
@@ -347,7 +330,7 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
             }
             uint64_t got = 0;
             while (got < o - a0 + n) {   // (the widened tail of the copy's last expert runs past the end of the file)
-                const ssize_t r = ::pread(fd, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                const ssize_t r = ::pread(cfd_, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
                 if (r <= 0) {
                     std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
                     std::exit(6);
@@ -359,7 +342,7 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
             return;
         }
         while (n > 0) {
-            const ssize_t r = ::pread(fd, p, (size_t) n, (off_t) o);
+            const ssize_t r = ::pread(cfd_, p, (size_t) n, (off_t) o);
             if (r <= 0) {
                 std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
                 std::exit(6);
@@ -375,20 +358,7 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
     const uint64_t dst = k == 0 ? 0 : (k == 1 ? x.gs : x.gs + x.us);
     const uint64_t a = len * (uint64_t) p / (uint64_t) split_ / 4096 * 4096;
     const uint64_t b = p + 1 == split_ ? len : len * (uint64_t) (p + 1) / (uint64_t) split_ / 4096 * 4096;
-    bool ok = b <= a;
-    if (!ok && cache && fd_c_ >= 0) {   // read() is the F_NOCACHE descriptor's; the cached one is read here the same way
-        uint8_t* q = host_[(size_t) s] + dst + a;
-        uint64_t n = b - a, o = src + a;
-        ok = true;
-        while (ok && n > 0) {
-            const ssize_t r = ::pread(fd_c_, q, (size_t) std::min<uint64_t>(n, 64ull << 20), (off_t) o);
-            ok = r > 0;
-            if (ok) { q += r; o += (uint64_t) r; n -= (uint64_t) r; }
-        }
-    } else if (!ok) {
-        ok = read(host_[(size_t) s] + dst + a, b - a, src + a);
-    }
-    if (!ok) {
+    if (b > a && !read(host_[(size_t) s] + dst + a, b - a, src + a)) {
         std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
         std::exit(6);
     }
@@ -396,28 +366,18 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
 }
 
 void ExpertStream::io_main() {
-    // STRATA_METAL_IO_RESERVE=R (opt-in): at most nio_ - R decode read-aheads in flight, so R threads are free the moment a layer's
-    // misses are queued (the SSD is near its bandwidth in decode: a miss queued behind six read-aheads waits for them)
-    static const int reserve = std::max(0, env_int("STRATA_METAL_IO_RESERVE", 0));
     for (;;) {
         Job j;
-        bool counted = false;
         {
             std::unique_lock<std::mutex> g(mu_);
-            cv_.wait(g, [&] {
-                return stop_ || !urgent_q_.empty() ||
-                       (!pre_q_.empty() && (pre_q_.front().kind != 2 || pre_inflight_ < nio_ - reserve));
-            });
+            cv_.wait(g, [&] { return stop_ || !urgent_q_.empty() || !pre_q_.empty(); });
             if (stop_) return;
             if (!urgent_q_.empty()) { j = urgent_q_.front(); urgent_q_.pop_front(); }
-            else {
-                j = pre_q_.front(); pre_q_.pop_front();
-                if (j.kind == 2) { ++pre_inflight_; counted = true; }
-            }
+            else { j = pre_q_.front(); pre_q_.pop_front(); }
             slots_[(size_t) j.slot].state = 2;
         }
         const double tr = now_ms();
-        read_part(j.slot, j.layer, j.e, j.part, j.cache);
+        read_part(j.slot, j.layer, j.e, j.part);
         {
             const double ms = now_ms() - tr;
             const int k = j.kind < 0 || j.kind > 2 ? 2 : j.kind;
@@ -429,7 +389,6 @@ void ExpertStream::io_main() {
         {
             std::lock_guard<std::mutex> g(mu_);
             Slot& x = slots_[(size_t) j.slot];
-            if (counted) --pre_inflight_;
             if (--x.left == 0) {
                 smap_.as<uint32_t>()[j.layer * NE + j.e] = code_[(size_t) j.slot];
                 x.state = 0;
@@ -438,12 +397,11 @@ void ExpertStream::io_main() {
                 done = true;
             }
         }
-        if (counted && reserve > 0) cv_.notify_one();
         if (done) done_cv_.notify_all();
     }
 }
 
-void ExpertStream::submit(int s, int l, int e, bool urgent, bool cache, int kind) {
+void ExpertStream::submit(int s, int l, int e, bool urgent, int kind) {
     Slot& x = slots_[(size_t) s];
     x.layer = (int16_t) l;
     x.e = (int16_t) e;
@@ -453,7 +411,7 @@ void ExpertStream::submit(int s, int l, int e, bool urgent, bool cache, int kind
     x.left = parts;
     ++outstanding_;
     where_[(size_t) (l * NE + e)] = s;
-    for (int p = 0; p < parts; ++p) (urgent ? urgent_q_ : pre_q_).push_back({s, l, e, p, cache, (int8_t) kind});
+    for (int p = 0; p < parts; ++p) (urgent ? urgent_q_ : pre_q_).push_back({s, l, e, p, (int8_t) kind});
 }
 
 // a queued read-ahead nobody wants: its pieces dropped, the slot freed (only before any piece has started)
@@ -627,7 +585,7 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
             std::lock_guard<std::mutex> g(mu_);
             for (const auto& p : order) {
                 const int c = lay_[(size_t) p.first].cls;
-                submit(next_free[(size_t) c]++, p.first, p.second, true, page_cache_ >= 2, 2);
+                submit(next_free[(size_t) c]++, p.first, p.second, true, 2);
             }
         }
         cv_.notify_all();
@@ -728,7 +686,7 @@ void ExpertStream::ahead(int ln, int T, const float* pred, int K) {
             if (s0 >= 0) { lru_front(s0); continue; }
             const int s = victim(lay_[(size_t) ln].cls);
             if (s < 0) break;
-            submit(s, ln, pw[j].second, false, page_cache_ >= 1, 2);
+            submit(s, ln, pw[j].second, false, 2);
             slots_[(size_t) s].pin = stamp_;
             if (pre_mru_) lru_front(s);
             else lru_back(s);
@@ -821,21 +779,11 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
             ++(prompt ? p_misses_ : misses_);
             s = victim(lay_[(size_t) l].cls);
             if (s < 0) { std::fprintf(stderr, "strata metal stream: no free slot (layer %d)\n", l); std::exit(6); }
-            submit(s, l, e, true, page_cache_ >= (prompt ? 2 : 1), prompt ? 0 : 1);
+            submit(s, l, e, true, prompt ? 0 : 1);
             slots_[(size_t) s].pin = stamp_;
             if (!prompt) lru_front(s);
             wait.push_back(s);
         }
-    }
-    // STRATA_METAL_AHEAD_FIRST=1: the next layer's read-ahead is queued before this layer's misses are waited for (the I/O
-    // threads still take the urgent queue first), so the GPU resumes the moment the misses land, not after the host has
-    // also ranked the predictions.
-    static const bool ahead_first = env_int("STRATA_METAL_AHEAD_FIRST", 0) != 0;
-    bool ahead_done = false;
-    if (ahead_first && !prompt && !wait.empty()) {
-        if (prefetch_ && pred && l + 1 < NL) ahead(l + 1, T, pred, pre_k_);
-        if (pre_k2_ > 0 && pred2 && l + 2 < NL) ahead(l + 2, T, pred2, pre_k2_);
-        ahead_done = true;
     }
     if (!wait.empty()) {
         cv_.notify_all();
@@ -858,7 +806,7 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
                 if (where_[(size_t) (ln * NE + e)] >= 0) continue;
                 const int s = victim(lay_[(size_t) ln].cls);
                 if (s < 0) break;
-                submit(s, ln, e, false, page_cache_ >= 2, 0);
+                submit(s, ln, e, false, 0);
                 slots_[(size_t) s].pin = stamp_;
                 ++p_streamed_;
                 any = true;
@@ -869,8 +817,8 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
         return;
     }
     // read-ahead: layer l + 1 (each token's top pre_k_ of the predicted router logits), then layer l + 2 (top pre_k2_)
-    if (!ahead_done && prefetch_ && pred && l + 1 < NL) ahead(l + 1, T, pred, pre_k_);
-    if (!ahead_done && pre_k2_ > 0 && pred2 && l + 2 < NL) ahead(l + 2, T, pred2, pre_k2_);
+    if (prefetch_ && pred && l + 1 < NL) ahead(l + 1, T, pred, pre_k_);
+    if (pre_k2_ > 0 && pred2 && l + 2 < NL) ahead(l + 2, T, pred2, pre_k2_);
     host_ms_ += now_ms() - t0;
 }
 

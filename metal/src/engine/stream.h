@@ -79,19 +79,19 @@ private:
     struct Lay { uint64_t g, gs, u, us, d, ds; int cls; };
     struct Slot { int16_t layer = -1; int16_t e = -1; int prev = -1, next = -1; bool pre = false; int left = 0; uint64_t pin = 0; std::atomic<int> state{0}; };  // 0 idle, 1 queued, 2 reading
     struct Cls { uint64_t pages = 0; int n = 0; int base = 0; int head = -1, tail = -1; };  // slot range [base, base+n)
-    // part: slice * split_ + piece; cache: read through the page cache; kind: 0 prompt, 1 decode miss, 2 read-ahead or fill
-    struct Job { int slot; int layer, e, part; bool cache; int8_t kind; };
+    // part: slice * split_ + piece; kind: 0 prompt, 1 decode miss, 2 read-ahead or fill (the I/O latency stats)
+    struct Job { int slot; int layer, e, part; int8_t kind; };
     void lru_unlink(int s);
     void lru_front(int s);
     void lru_back(int s);
     int cls_of(int s) const;
     int victim(int cls);
-    void read_part(int slot, int l, int e, int part, bool cache);
+    void read_part(int slot, int l, int e, int part);
     void cancel_slot(int s);
     void promote_slot(int s);
     void io_main();
     void ahead(int ln, int T, const float* pred, int K);
-    void submit(int slot, int l, int e, bool urgent, bool cache, int kind);
+    void submit(int slot, int l, int e, bool urgent, int kind);
     void wait_slot(int s);
     uint8_t* standalone_region(uint64_t bytes);   // the prompt's buffers as their own allocation, when no region of the arena's slots takes them
 
@@ -100,12 +100,6 @@ private:
     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
     int cfd_ = -1;
-    // STRATA_METAL_PAGE_CACHE (opt-in): 1 = the decode's misses and read-aheads are read through macOS's file cache (a second,
-    // elastic expert tier: a miss the file cache still holds is a memory copy, not an SSD read; the cache's pages are clean and
-    // macOS drops them under pressure instead of compressing or swapping them); 2 = every read, prompts included.  The fds
-    // below are the same files without F_NOCACHE; the default (0) reads everything with F_NOCACHE, as before.
-    int fd_c_ = -1, cfd_c_ = -1;
-    int page_cache_ = 0;
     // STRATA_METAL_ROUTE_TRACE=<path> (test tooling): every handshake's routed ids (and the read-ahead's predicted top 16 per
     // token for the next layer), appended as binary records for offline cache/prefetch simulation
     FILE* trace_ = nullptr;
@@ -129,7 +123,6 @@ private:
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::deque<Job> urgent_q_, pre_q_;
-    int pre_inflight_ = 0;   // decode read-aheads being read now (STRATA_METAL_IO_RESERVE)
     bool stop_ = false;
     int outstanding_ = 0;
     int nio_ = 6, pre_k_ = 10, pre_k2_ = 0, split_ = 2;

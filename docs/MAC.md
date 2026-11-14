@@ -574,6 +574,12 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_WIRE_ARENA=0` | Streaming, 64 GB or more: leave the filled arena pageable (default: wired) |
 | `STRATA_METAL_IGNORE_REPACK=1` | Start although a model repack or setup's preparation is running (the engine refuses by default) |
 | `STRATA_METAL_KEEP_HOST_WEIGHTS=1` | Streaming: keep the host code's own copies of the weights (2 to 3 GB) |
+| `STRATA_METAL_DIRECT=1` | Streaming from the experts' copy: read each expert as whole pages into a per-thread buffer, so nothing lands in macOS's file cache (unaligned `F_NOCACHE` reads kept about 35% of the bytes cached, which pushed the arena itself into the compressor) |
+| `STRATA_METAL_KEEP_WARM=1` | Streaming: while a decode window waits for the SSD, a second queue runs tiny GPU ticks so the GPU stays clocked up between segments (`STRATA_METAL_WARM_TG`, `STRATA_METAL_WARM_ITERS` size a tick) |
+| `STRATA_METAL_REGION_FIT=1` | Streaming: lay the biggest slot class out last, so a prompt's buffers fit in a region of the arena instead of their own allocation |
+| `STRATA_METAL_PROMPT_SMALL=N` | Streaming: prompts of at most N tokens get a small buffer set of their own and leave the arena's region (and its experts) alone |
+| `STRATA_METAL_IO_THREADS=N`, `STRATA_METAL_READ_SPLIT=N`, `STRATA_METAL_PREFETCH=K`, `STRATA_METAL_PREFETCH2=K` | Streaming: I/O threads (default 6), requests per expert (1), read-ahead top K of the next layer (6 for a big model such as Flash-Next, else 10) and of the one after (0) |
+| `STRATA_METAL_ROUTE_TRACE=path`, `STRATA_METAL_SEG_TIMING=1`, `STRATA_METAL_KPROF_STREAM=1` | Streaming diagnostics: binary routing trace for cache simulations, per-segment GPU/host/wait times, per-kernel times of a segmented window |
 | `STRATA_METAL_TRACE=1`, `STRATA_METAL_PROFILE=1`, `STRATA_METAL_KPROF=T` | Per-window traces, a time breakdown, per-kernel GPU times |
 
 ## How it works

@@ -47,11 +47,15 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <thread>
 #include <vector>
 
 namespace strata::kernels { void cvec_metal_bind_flag(int*); }
-namespace strata::gpu { uint64_t purge_device_allocations(size_t min_bytes); }   // metal/src/gpu/runtime.cpp
+namespace strata::gpu {
+uint64_t purge_device_allocations(size_t min_bytes);   // metal/src/gpu/runtime.cpp
+void report_device_allocations();
+}
 
 namespace strata::metal_engine {
 
@@ -1485,10 +1489,28 @@ bool Window::stream_arena(std::string& err) {
     size_t len = sizeof phys;
     sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
     const double gb = 1e9;
+    const bool alloc_log = std::getenv("STRATA_METAL_ALLOC_LOG") != nullptr;
     if (!(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS") && std::string(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS")) == "1")) {
+        const ProcMem before = proc_mem();
         const uint64_t g = strata::gpu::purge_device_allocations(32u << 20);
+        // the released buffers' pages come back to macOS asynchronously (within ~0.3 s): the arena is sized from the memory
+        // available after that, so wait (at most 2 s) until the footprint has dropped by most of what was given back
+        ProcMem after = proc_mem();
+        for (int i = 0; i < 40 && (double) after.footprint > (double) before.footprint - 0.9 * (double) g; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            after = proc_mem();
+        }
         std::fprintf(stderr, "strata metal stream: %.2f GB of the host code's device weight copies given back (unused by the "
-                             "Metal window)\n", g / 1e9);
+                             "Metal window): footprint %.2f -> %.2f GB, resident %.2f -> %.2f GB\n", g / 1e9,
+                     before.footprint / gb, after.footprint / gb, before.rss / gb, after.rss / gb);
+    }
+    if (alloc_log) {   // where the footprint before the arena is (diagnostics)
+        strata::gpu::report_device_allocations();
+        malloc_statistics_t ms{};
+        malloc_zone_statistics(nullptr, &ms);
+        std::fprintf(stderr, "strata metal stream: malloc holds %.2f GB in use (%.2f GB allocated from the system); the Metal "
+                             "window's own buffers %.2f GB\n", ms.size_in_use / 1e9, ms.size_allocated / 1e9,
+                     (double) cx_->allocated() / 1e9);
     }
     const double used = (double) cx_->allocated();
     // what macOS gives now without paging anything out (arena_avail: free, purgeable, the clean file cache; not other

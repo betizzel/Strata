@@ -133,6 +133,7 @@ namespace strata::metal_engine {   // metal/src/engine/window.cpp
 void set_model_shard(const char* shard1);
 void report_expert_stream();
 }
+namespace strata::gpu { void weight_scope(bool on); }   // metal/src/gpu/runtime.cpp: purged with the other weight copies
 #endif
 
 #include <array>
@@ -4526,7 +4527,14 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+#if defined(STRATA_GPU_METAL)
+        strata::gpu::weight_scope(true);
+#endif
+        const bool nd_ok = native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key);
+#if defined(STRATA_GPU_METAL)
+        strata::gpu::weight_scope(false);
+#endif
+        if (!nd_ok) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
