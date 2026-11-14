@@ -41,7 +41,8 @@ target_link_libraries(mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
 
 file(GLOB STRATA_METAL_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
 list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp
-                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/dsu_ref_vs_ggml.cpp)   # (needs ggml: below)
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_purge.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/dsu_ref_vs_ggml.cpp)   # (need the device runtime or ggml: below)
 foreach(src ${STRATA_METAL_TESTS})
   get_filename_component(t ${src} NAME_WE)
   add_executable(${t} ${src})
@@ -68,6 +69,9 @@ add_executable(runtime_hello tests/runtime_hello.cpp)
 target_link_libraries(runtime_hello PRIVATE strata_core_metal)
 enable_testing()
 add_test(NAME runtime_hello COMMAND runtime_hello)
+add_executable(runtime_purge tests/runtime_purge.cpp)
+target_link_libraries(runtime_purge PRIVATE strata_gpu_metal)
+add_test(NAME runtime_purge COMMAND runtime_purge)
 
 # The engine: ggml (the native expert formats' type traits and ggml-cpu) from the tree vendored in third_party/strata-ggml (frozen at the
 # commit the PC build pins, 3cf03257).  -DSTRATA_GGML_DIR=<llama.cpp checkout> builds from that checkout instead (an override kept for two releases).

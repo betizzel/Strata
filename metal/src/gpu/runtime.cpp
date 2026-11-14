@@ -54,6 +54,7 @@ struct Alloc {
     size_t bytes = 0;
     bool host = false;   // from host_alloc (the host code holds the CPU address)
     bool purged = false; // purge_device_allocations: its memory given back (any later copy is an error)
+    bool weight = false; // made inside weight_scope(): a weight copy for the CUDA-shaped kernels, purged whatever its size
 };
 
 struct Op {
@@ -173,6 +174,15 @@ const Alloc* find(const void* p, size_t* off) {
         if ((uintptr_t) p < ic->first + al.bytes) { *off = (uintptr_t) p - ic->first; return &al; }
     }
     return nullptr;
+}
+
+/// A new buffer may take GPU addresses of one purge_device_allocations gave back (and released): those entries go, so
+/// find() names the new buffer, not the old one.  Under r.mu.
+void forget_purged_overlapping(Runtime& r, uint64_t lo, size_t n) {
+    for (auto it = r.by_gpu.begin(); it != r.by_gpu.end();) {
+        if (it->second.purged && it->first < lo + n && lo < it->first + it->second.bytes) it = r.by_gpu.erase(it);
+        else ++it;
+    }
 }
 
 #if defined(STRATA_DS4_RUNTIME)
@@ -367,6 +377,8 @@ void alloc_log(const char* what, size_t n) {
     if (on && n >= (16u << 20)) std::fprintf(stderr, "strata metal runtime: %s %.1f MB (total %.2f GB)\n", what, n / 1e6, t / 1e9);
 }
 
+std::atomic<int> g_weight_scope{0};   // weight_scope(): > 0 while the host code uploads weight copies
+
 Error new_alloc(void** p, size_t bytes, bool host) {
     Runtime& r = rt();
 #if defined(STRATA_DS4_RUNTIME)
@@ -378,9 +390,11 @@ Error new_alloc(void** p, size_t bytes, bool host) {
     MTL::Buffer* b = r.dev->newBuffer(n, MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked);
     if (!b) return fail(kErrorMemoryAllocation);
     Alloc a{b, b->gpuAddress(), (uint8_t*) b->contents(), n, host};
+    a.weight = !host && g_weight_scope.load() > 0;
     alloc_log(host ? "host alloc" : "device alloc", n);
     {
         std::lock_guard<std::mutex> lk(r.mu);
+        forget_purged_overlapping(r, a.gpu, n);
         r.by_gpu[a.gpu] = a;
         r.by_cpu[(uintptr_t) a.cpu] = a.gpu;
         r.rs->addAllocation(b);
@@ -396,6 +410,12 @@ Error free_alloc(void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
     if (!a || off != 0) return fail(kErrorInvalidValue);
+    if (a->purged) {   // given back already (purge_device_allocations released it): only its entry is left
+        const uint64_t g = a->gpu;
+        std::lock_guard<std::mutex> lk(r.mu);
+        r.by_gpu.erase(g);
+        return kSuccess;
+    }
 #if defined(STRATA_DS4_RUNTIME)
     if (std::getenv("DS4_TRACE_FREE")) std::fprintf(stderr, "gpu free %zu bytes (host=%d) at %p\n", a->bytes, (int) a->host, p);
 #endif
@@ -433,28 +453,42 @@ MTL::ResidencySet* residency_set_impl() { return rt().rs; }
 void* host_view(const void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
-    return a ? a->cpu + off : nullptr;
+    return a && !a->purged ? a->cpu + off : nullptr;
 }
 
 // The Metal decode window reads the model itself; the device copies of the weights the shared host code uploads for
-// the CUDA-shaped kernels (the pack's dense pool, the native head, ...) are never read on Metal.  On a small Mac their
-// memory is worth more as expert arena: every device (not host) allocation of min_bytes or more is made purgeable-empty
-// and dropped from the residency set.  Returns the bytes given back.
+// the CUDA-shaped kernels (the pack's dense pool, the native head, the native projection matrices, ...) are never read
+// on Metal.  On a small Mac their memory is worth more as expert arena: every device (not host) allocation of min_bytes
+// or more, and every one made inside weight_scope() (the native projections are each below 32 MB), is dropped from the
+// residency set and released.  Its GPU address range stays listed as given back, so a later copy or fill into it stops
+// with check_purged() instead of touching freed memory.  Releasing is what gives the memory back: a buffer that has been
+// in the residency set keeps its pages through setPurgeableState(Empty), even after removeAllocation and commit
+// (measured on an M5 Pro: footprint and resident size unchanged; after release() they drop within 0.3 s).
+// Returns the bytes.
 uint64_t purge_device_allocations(size_t min_bytes) {
     Runtime& r = rt();
     device_synchronize();
-    std::lock_guard<std::mutex> lk(r.mu);
+    std::vector<MTL::Buffer*> gone;
     uint64_t n = 0;
-    for (auto& [gpu, a] : r.by_gpu) {
-        if (a.host || a.purged || a.bytes < min_bytes) continue;
-        r.rs->removeAllocation(a.buf);
-        a.buf->setPurgeableState(MTL::PurgeableStateEmpty);
-        a.purged = true;
-        n += a.bytes;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        for (auto& [gpu, a] : r.by_gpu) {
+            if (a.host || a.purged || (a.bytes < min_bytes && !a.weight)) continue;
+            r.rs->removeAllocation(a.buf);
+            r.by_cpu.erase((uintptr_t) a.cpu);   // its CPU addresses go back to the process (malloc may take them)
+            gone.push_back(a.buf);
+            a.buf = nullptr;
+            a.cpu = nullptr;
+            a.purged = true;
+            n += a.bytes;
+        }
+        r.rs->commit();
     }
-    r.rs->commit();
+    for (MTL::Buffer* b : gone) b->release();
     return n;
 }
+
+void weight_scope(bool on) { g_weight_scope += on ? 1 : -1; }
 
 Error get_last_error() { const Error e = t_last; t_last = kSuccess; return e; }
 Error peek_last_error() { return t_last; }
@@ -532,6 +566,7 @@ Error host_register(void* p, size_t bytes, unsigned) {
     Alloc a{b, b->gpuAddress(), (uint8_t*) b->contents(), n, true};
     alloc_log("host register", n);
     std::lock_guard<std::mutex> lk(r.mu);
+    forget_purged_overlapping(r, a.gpu, n);
     r.by_gpu[a.gpu] = a;
     r.by_cpu[(uintptr_t) a.cpu] = a.gpu;
     r.rs->addAllocation(b);

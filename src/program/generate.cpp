@@ -164,6 +164,7 @@ bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only,
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 }
+namespace strata::gpu { void weight_scope(bool on); }   // metal/src/gpu/runtime.cpp: purged with the other weight copies
 #endif
 
 #include <array>
@@ -5282,7 +5283,14 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+#if defined(STRATA_GPU_METAL)
+        strata::gpu::weight_scope(true);
+#endif
+        const bool nd_ok = native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key);
+#if defined(STRATA_GPU_METAL)
+        strata::gpu::weight_scope(false);
+#endif
+        if (!nd_ok) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
