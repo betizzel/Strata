@@ -270,7 +270,7 @@ private:
     mtl::Buffer rcounter_;
     // STRATA_METAL_KPROF=T (test tooling): once, after the 20th cached window of T tokens with the head, the GPU time
     // of each kernel class alone (the window's own dispatches of that pipeline + weight role, run by themselves)
-    void kprof(const std::vector<mtl::Dispatch>& ds, int Tn);
+    void kprof(const std::vector<mtl::Dispatch>& ds, int Tn, const std::vector<int>& cuts = {});
     void fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp);
     // the encoded window per (T, head, hp_): built once, then only the positions are patched (the host's encode cost)
     struct Cached {
@@ -305,6 +305,7 @@ private:
     // prompts on the matrix units (prompt_chunk below)
     struct PromptGemm;
     PromptGemm* pg_ = nullptr;
+    PromptGemm* pgs_ = nullptr;   // STRATA_METAL_PROMPT_SMALL: the short prompts' own small set (no arena region)
     const int32_t* cut_ids_ = nullptr;    // the routed ids the handshake reads (a prompt chunk's; else ids_)
     const mtl::Buffer* mtp_src_ = nullptr;   // the rows the draft layer's prompt K/V read (a prompt chunk's; else R_)
     double pg_ms_ = 0;
@@ -314,6 +315,9 @@ public:
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
     int prompt_chunk_rows() const;
+    int prompt_small_rows() const;
+    void prompt_use_small(bool on) { small_now_ = on; }
+    bool small_now_ = false;
     void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
     void stream_report(FILE* f) const {
         if (!st_) return;
@@ -323,7 +327,13 @@ public:
             if (win_n_[t])
                 std::fprintf(f, "stream windows T=%d     %d (%s): %.2f ms each (GPU incl. the host's turns %.2f ms)\n", t, win_n_[t],
                              t == 8 ? "prompt rows" : "decode", win_ms_[t] / win_n_[t], win_gpu_[t] / win_n_[t]);
+        if (pg_tok_ > 0)
+            std::fprintf(f, "stream prompt chunks: %lld tokens on the matrix units in %.1f ms (%.1f tok/s)\n", (long long) pg_tok_,
+                         pg_ms_, pg_tok_ / std::max(1e-9, pg_ms_ / 1e3));
+        profile_report(f);
+        if (cx_) cx_->seg_report(f);
     }
+    void profile_report(FILE* f) const;
     int win_n_[MAXT + 1] = {};
     double win_ms_[MAXT + 1] = {}, win_gpu_[MAXT + 1] = {};
     void at_cut(int s);
@@ -1344,8 +1354,11 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         if (net_error_[0]) { err = net_error_; return false; }
         {
             static const int kt = std::getenv("STRATA_METAL_KPROF") ? std::atoi(std::getenv("STRATA_METAL_KPROF")) : 0;
+            // streaming: only with STRATA_METAL_KPROF_STREAM=1 (the kernel classes are rerun outside the handshakes, on
+            // whatever the arena holds: timing only, as with STRATA_METAL_STREAM_FAKE)
+            static const bool ks = std::getenv("STRATA_METAL_KPROF_STREAM") != nullptr;
             static int seen = 0;
-            if (kt == Tn && head && ++seen == 20 && !stream_) kprof(c.ds, Tn);
+            if (kt == Tn && head && ++seen == 20 && (!stream_ || ks)) kprof(c.ds, Tn, stream_ ? c.cuts : std::vector<int>{});
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
@@ -1434,7 +1447,9 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
 
 double Window::run_ds(Cached& c) {
     if (!stream_) return cx_->run_graph(c.ds);
-    return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+    // STRATA_METAL_KEEP_WARM=1: decode windows only (a prompt chunk keeps the GPU busy itself; measured slower with it)
+    static const bool warm = std::getenv("STRATA_METAL_KEEP_WARM") && std::atoi(std::getenv("STRATA_METAL_KEEP_WARM")) != 0;
+    return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this, warm, true);
 }
 
 namespace {
@@ -1608,7 +1623,7 @@ void Window::logpos(int Tn, const int32_t* tokens, int64_t pos0, bool head) {
     lp_pend_ = true;
 }
 
-void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
+void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn, const std::vector<int>& cuts) {
     std::map<const mtl::Pipeline*, std::string> pname;
     for (const auto& [k, v] : pcache_) pname[&v] = k.substr(0, k.find('#'));
     std::map<uint64_t, std::string> tname;
@@ -1640,6 +1655,33 @@ void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
         return t[3];
     };
     const double all = med(ds);
+    if (!cuts.empty()) {
+        // the same dispatches through the handshakes: the host's turn a no-op, then a fixed busy wait of D us per turn
+        // (STRATA_METAL_KPROF_HOST_US, default 1000): what the segmentation and the GPU's idle time cost by themselves
+        static const double hus = std::getenv("STRATA_METAL_KPROF_HOST_US") ? std::atof(std::getenv("STRATA_METAL_KPROF_HOST_US")) : 1000.0;
+        static double busy_us = 0;
+        auto seg = [&](double us, bool warm) {
+            busy_us = us;
+            std::vector<double> t, w;
+            for (int i = 0; i < 7; ++i) {
+                const double t0 = now_ms();
+                t.push_back(1000.0 * cx_->run_graph_seg(ds, cuts, [](void*, int) {
+                    const double s0 = now_ms();
+                    while ((now_ms() - s0) * 1000.0 < busy_us) {}
+                }, nullptr, warm));
+                w.push_back(now_ms() - t0);
+            }
+            std::sort(t.begin(), t.end());
+            std::sort(w.begin(), w.end());
+            return std::make_pair(t[3], w[3]);
+        };
+        const double turns = cuts.size() * hus / 1000.0;
+        const auto s0 = seg(0.0, false), s1 = seg(hus, false), s2 = seg(hus, true), s3 = seg(2 * hus, false), s4 = seg(2 * hus, true);
+        std::fprintf(stderr, "strata metal kprof: window T%d through %zu handshakes (wall less the host turns): turn 0 us %.3f ms; "
+                             "turn %.0f us %.3f ms, with keep-warm %.3f ms; turn %.0f us %.3f ms, with keep-warm %.3f ms\n", Tn,
+                     cuts.size(), s0.second, hus, s1.second - turns, s2.second - turns, 2 * hus, s3.second - 2 * turns,
+                     s4.second - 2 * turns);
+    }
     std::vector<std::pair<double, std::string>> rows;
     double sum = 0;
     for (const auto& [c, v] : by) {
@@ -1656,11 +1698,17 @@ void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
 Window::~Window() {
     if (cvec_on_.ptr) strata::kernels::cvec_metal_bind_flag(nullptr);
     if (logpos_) std::fclose(logpos_);
+    profile_report(stderr);
+}
+
+// STRATA_METAL_PROFILE: the windows' time split (the destructor, and the server's orderly QUIT through stream_report,
+// which ends the process with _Exit before any destructor runs)
+void Window::profile_report(FILE* f) const {
     if (std::getenv("STRATA_METAL_PROFILE") == nullptr) return;
-    auto line = [](const char* what, const Prof& x) {
+    auto line = [f](const char* what, const Prof& x) {
         if (x.n == 0) return;
-        std::fprintf(stderr, "strata metal profile: %-10s %6lld x  %.3f ms: host before %.3f, run_graph %.3f (GPU %.3f, so "
-                             "encode/submit/wait %.3f), patch+finish %.3f\n", what, (long long) x.n, x.all / x.n, x.pre / x.n,
+        std::fprintf(f, "strata metal profile: %-10s %6lld x  %.3f ms: host before %.3f, run_graph %.3f (GPU %.3f, so "
+                        "encode/submit/wait %.3f), patch+finish %.3f\n", what, (long long) x.n, x.all / x.n, x.pre / x.n,
                      x.rg / x.n, x.gpu / x.n, (x.rg - x.gpu) / x.n, x.fin / x.n);
     };
     for (const auto& [k, x] : prof_) {
@@ -2362,6 +2410,7 @@ struct Window::PromptGemm {
 };
 
 int Window::prompt_chunk_rows() const { return pg_ ? pg_->MT : 0; }
+int Window::prompt_small_rows() const { return pgs_ ? pgs_->MT : 0; }
 
 bool Window::prompt_gemm_on(int64_t n) const {
     if (net_) return false;
@@ -2390,23 +2439,31 @@ bool Window::prompt_gemm_init(std::string& err) {
     sysctlbyname("hw.memsize", &phys, &plen, nullptr, 0);
     const int stream_chunk = phys >= (96ull << 30) ? 4096 : 1024;
     const int C = std::max(64, ec ? std::atoi(ec) : (stream_ ? stream_chunk : 2048)) / 64 * 64;
+    // build(Cb, in_region, from): a set of buffers for chunks of Cb rows, placed in the arena's region (in_region) or allocated;
+    // `from` lends its compiled libraries and kernel choices (a second set compiles nothing)
+    auto build = [&](int Cb, bool in_region, const PromptGemm* from) -> PromptGemm* {
     auto pg = std::make_unique<PromptGemm>();
     PromptGemm& p = *pg;
-    p.MT = C;
-    p.QS = std::min(C, 256);
-    p.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal", "gemv.metal",
-                          "prompt.metal"});
-    p.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
-    p.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
-    p.k4 = ::coop_k4(*cx_);
-    const char* eg = std::getenv("STRATA_METAL_PROMPT_EXPERTS");   // v2 | v3 (default: v3 with the M5's layout)
-    p.gu_v3 = p.dn_v3 = eg ? std::string(eg) == "v3" : p.k4;
-    if (T("blk.0.ffn_gate_exps.weight").type >= 144) p.gu_v3 = p.dn_v3 = false;   // the trellis experts have the v2 kernels only
-    const char* eq = std::getenv("STRATA_METAL_PROMPT_QSA");       // v1 | flash (default: flash with the M5's layout)
-    p.flash = eq ? std::string(eq) == "flash" : p.k4;
-    const size_t MT = (size_t) C;
-    p.maxrows = C * TOPK + NEXP * p.TM;
-    p.nblk_max = (C * TOPK + 1023) / 1024;
+    p.MT = Cb;
+    p.QS = std::min(Cb, 256);
+    if (from) {
+        p.lib = from->lib; p.lgdn = from->lgdn; p.lqsa = from->lqsa; p.k4 = from->k4;
+        p.gu_v3 = from->gu_v3; p.dn_v3 = from->dn_v3; p.flash = from->flash;
+    } else {
+        p.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal", "gemv.metal",
+                              "prompt.metal"});
+        p.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
+        p.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
+        p.k4 = ::coop_k4(*cx_);
+        const char* eg = std::getenv("STRATA_METAL_PROMPT_EXPERTS");   // v2 | v3 (default: v3 with the M5's layout)
+        p.gu_v3 = p.dn_v3 = eg ? std::string(eg) == "v3" : p.k4;
+        if (T("blk.0.ffn_gate_exps.weight").type >= 144) p.gu_v3 = p.dn_v3 = false;   // the trellis experts have the v2 kernels only
+        const char* eq = std::getenv("STRATA_METAL_PROMPT_QSA");       // v1 | flash (default: flash with the M5's layout)
+        p.flash = eq ? std::string(eq) == "flash" : p.k4;
+    }
+    const size_t MT = (size_t) Cb;
+    p.maxrows = Cb * TOPK + NEXP * p.TM;
+    p.nblk_max = (Cb * TOPK + 1023) / 1024;
     const int MB = (int) max_cells_ / 4 + 2;
     // the buffers: measured first, then placed - on a streaming Mac inside the expert arena (a region of its slots
     // reserved only while a prompt runs: the prompt's scratch costs no decode memory), else allocated
@@ -2455,22 +2512,32 @@ bool Window::prompt_gemm_init(std::string& err) {
     };
     make();
     measure = false;
-    if (stream_) {
+    if (in_region) {
         region = st_->region(need);
-        if (region == nullptr) { err = "metal prompt: no arena region for the prompt buffers"; return false; }
+        if (region == nullptr) { err = "metal prompt: no arena region for the prompt buffers"; return nullptr; }
     }
     make();
-    pg_ = pg.release();
     std::fprintf(stderr, "strata metal: prompts on the matrix units in chunks of %d (experts %s, QSA %s, matmul2d layout %s; "
-                         "%.2f GB of buffers%s)\n", C, p.gu_v3 ? "v3" : "v2", p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
-                 need / 1e9, stream_ ? ", in the expert arena while a prompt runs" : "");
-    (void) err;
+                         "%.2f GB of buffers%s)\n", Cb, p.gu_v3 ? "v3" : "v2", p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
+                 need / 1e9, in_region ? ", in the expert arena while a prompt runs" : ", their own allocation");
+    return pg.release();
+    };
+    pg_ = build(C, stream_, nullptr);
+    if (pg_ == nullptr) return false;
+    // STRATA_METAL_PROMPT_SMALL=S (opt-in, streaming): a second, small set of buffers (chunks of S rows, their own allocation) for
+    // prompts of at most S tokens - a short follow-up (an agent's tool result) then does not empty the arena's region
+    if (const char* es = std::getenv("STRATA_METAL_PROMPT_SMALL"); es && stream_) {
+        const int S = std::atoi(es) / 64 * 64;
+        if (S >= 64 && S < C) pgs_ = build(S, false, pg_);
+    }
     return true;
 }
 
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
     if (net_) { err = "metal network experts: prompt chunks cannot bypass remote ownership"; return false; }
-    PromptGemm& p = *pg_;
+    // a chunk that fits the small set (STRATA_METAL_PROMPT_SMALL) runs in it; prompt_run_rows only sends such chunks
+    // for a prompt that fits it whole, and then holds no arena region
+    PromptGemm& p = (pgs_ && small_now_ && Tn <= pgs_->MT) ? *pgs_ : *pg_;
     p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
     p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
     auto TN = [this](const std::string& n) -> const gguf::Tensor& { return this->T(n); };
@@ -2935,16 +3002,20 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
         const int64_t mn = em ? std::atoll(em) : 64;
         if (!(e && std::string(e) == "0") && n >= mn) {
             if (!g_window->prompt_gemm_init(err)) return false;
-            const int C = g_window->prompt_chunk_rows();
+            const int S = g_window->prompt_small_rows();
+            const bool small = S > 0 && n <= S;   // a short prompt: the small set, the arena untouched
+            const int C = small ? S : g_window->prompt_chunk_rows();
             std::vector<int32_t> tk32((size_t) C);
-            g_window->prompt_region(true);
+            g_window->prompt_use_small(small);
+            if (!small) g_window->prompt_region(true);
             bool ok = true;
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
                 ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
             }
-            g_window->prompt_region(false);
+            if (!small) g_window->prompt_region(false);
+            g_window->prompt_use_small(false);
             return ok;
         }
     }

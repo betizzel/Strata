@@ -124,8 +124,11 @@ public:
     // s < cuts.size()) the GPU signals a shared event and waits until the host has run at_cut(s) - the host's turn
     // between two parts of one committed command buffer (the SSD-streaming handshake: the routing is read, the
     // missing experts are put in place).  Returns the GPU time in seconds.
+    // keep_warm (STRATA_METAL_KEEP_WARM decode windows): a trickle of tiny command buffers on a second queue while it runs.
     double run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
-                         void* user);
+                         void* user, bool keep_warm = false, bool timed = false);
+    // STRATA_METAL_SEG_TIMING: the streamed windows' segment / handshake time split (nothing without the switch)
+    void seg_report(FILE* f) const;
     // One command buffer per `run_cb` call, empty or not: measures commit+wait round trips.
     double run_wall(const std::vector<Dispatch>& ds, int reps, double* gpu_seconds = nullptr);
 

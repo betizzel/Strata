@@ -10,6 +10,8 @@
 #include <execinfo.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <pthread.h>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -18,6 +20,10 @@
 #include <map>
 #include <thread>
 #endif
+#include <condition_variable>
+#include <mach/mach_time.h>
+#include <mutex>
+#include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -1003,9 +1009,142 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
     }
 }
 
+// ---- STRATA_METAL_KEEP_WARM=1 (opt-in): while a streamed window waits for the host at its per-layer handshakes, a thread keeps a
+// trickle of tiny command buffers going on a second queue, so the GPU never sits idle long enough to drop into its deep idle state.
+// Measured on the M5 Pro (tools/hsbench: 48 segments of a 0.58 ms read, the host holding each handshake 2 ms): 160-177 ms a window
+// without it, 132 ms with it; at 1 ms there was no difference.  (A long spin kernel stopped by a host-written flag does not work
+// here: the GPU did not see the flag in time and every window waited for the spin's cap.)
+namespace {
+struct Warm {
+    std::once_flag once;
+    bool ok = false;
+    id<MTLCommandQueue> q = nil;
+    id<MTLComputePipelineState> ps = nil;
+    id<MTLBuffer> buf = nil;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool active = false;
+    uint64_t ticks = 0;
+};
+Warm g_warm;
+void warm_loop() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> g(g_warm.mu);
+            g_warm.cv.wait(g, [] { return g_warm.active; });
+        }
+        @autoreleasepool {
+            // the tick's size: STRATA_METAL_WARM_TG threadgroups of 64 threads (default 4), STRATA_METAL_WARM_ITERS LCG
+            // steps a thread (default 256)
+            static const uint32_t tg = std::getenv("STRATA_METAL_WARM_TG") ? (uint32_t) std::max(1, std::atoi(std::getenv("STRATA_METAL_WARM_TG"))) : 4u;
+            static const uint32_t iters = std::getenv("STRATA_METAL_WARM_ITERS") ? (uint32_t) std::max(1, std::atoi(std::getenv("STRATA_METAL_WARM_ITERS"))) : 256u;
+            id<MTLCommandBuffer> cb = [g_warm.q commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:g_warm.ps];
+            [enc setBuffer:g_warm.buf offset:0 atIndex:0];
+            [enc setBytes:&iters length:4 atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            ++g_warm.ticks;
+        }
+    }
+}
+void warm_set(id<MTLDevice> dev, bool on) {
+    std::call_once(g_warm.once, [dev] {
+        static const char* kSrc = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void warm_tick(device uint* buf [[buffer(0)]], constant uint& iters [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    uint x = t;
+    for (uint j = 0; j < iters; ++j) x = x * 1664525u + 1013904223u;
+    if (x == 0xdeadbeefu) buf[0] = x;
+}
+)MSL";
+        NSError* err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc] options:nil error:&err];
+        if (lib) g_warm.ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"warm_tick"] error:&err];
+        if (!g_warm.ps) return;
+        g_warm.q = [dev newCommandQueue];
+        g_warm.buf = [dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        g_warm.ok = true;
+        pthread_t th;
+        if (pthread_create(&th, nullptr, [](void*) -> void* { warm_loop(); return nullptr; }, nullptr) == 0) pthread_detach(th);
+    });
+    if (!g_warm.ok) return;
+    {
+        std::lock_guard<std::mutex> g(g_warm.mu);
+        g_warm.active = on;
+    }
+    if (on) g_warm.cv.notify_one();
+}
+}  // namespace
+
+// ---- STRATA_METAL_SEG_TIMING=1 (diagnostic): GPU timestamps at the start and end of every segment of a streamed window (a
+// counter sample buffer at the encoders' stage boundaries) and host timestamps at each handshake, mapped onto one clock.
+// Per window: segment execution, the host noticing the signal (detect), the host's turn, and the GPU resuming (resume),
+// with the resume latency and the next segment's execution by the length of the host's turn.  Printed by seg_report().
+namespace {
+struct SegTiming {
+    bool init = false, ok = false;
+    id<MTLCounterSampleBuffer> sb = nil;
+    double tick_ns = 1.0;
+    uint64_t windows = 0, cuts = 0;
+    double exec_ns = 0, detect_ns = 0, host_ns = 0, resume_ns = 0;
+    // by the host turn before it: < 0.25, 0.5, 1, 2, 4 ms, longer
+    uint64_t bn[6] = {};
+    double bresume[6] = {}, bexec[6] = {}, bhost[6] = {};
+};
+SegTiming g_seg;
+inline int turn_bucket(double ms) { return ms < 0.25 ? 0 : ms < 0.5 ? 1 : ms < 1 ? 2 : ms < 2 ? 3 : ms < 4 ? 4 : 5; }
+}  // namespace
+
+void Context::seg_report(FILE* f) const {
+    if (!g_seg.ok || g_seg.windows == 0) return;
+    const double w = (double) g_seg.windows;
+    std::fprintf(f, "strata metal segments: %llu windows, %llu handshakes; per window: GPU execution %.2f ms, host noticing the "
+                    "signal %.2f ms, host turns %.2f ms, GPU resuming %.2f ms\n", (unsigned long long) g_seg.windows,
+                 (unsigned long long) g_seg.cuts, g_seg.exec_ns / w / 1e6, g_seg.detect_ns / w / 1e6, g_seg.host_ns / w / 1e6,
+                 g_seg.resume_ns / w / 1e6);
+    static const char* names[6] = {"<0.25", "0.25-0.5", "0.5-1", "1-2", "2-4", ">4"};
+    for (int b = 0; b < 6; ++b)
+        if (g_seg.bn[b])
+            std::fprintf(f, "strata metal segments: host turn %-8s ms: %6llu turns (mean %.3f ms), GPU resume %.3f ms, next segment "
+                            "%.3f ms\n", names[b], (unsigned long long) g_seg.bn[b], g_seg.bhost[b] / g_seg.bn[b] / 1e6,
+                         g_seg.bresume[b] / g_seg.bn[b] / 1e6, g_seg.bexec[b] / g_seg.bn[b] / 1e6);
+}
+
 double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
-                              void* user) {
+                              void* user, bool keep_warm, bool timed) {
+    const bool warm = keep_warm;
+    static const bool timing = std::getenv("STRATA_METAL_SEG_TIMING") && std::atoi(std::getenv("STRATA_METAL_SEG_TIMING")) != 0;
     @autoreleasepool {
+        if (warm) warm_set(impl_->dev, true);
+        if (timing && !g_seg.init) {
+            g_seg.init = true;
+            if ([impl_->dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                for (id<MTLCounterSet> cs in impl_->dev.counterSets)
+                    if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                        MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+                        d.counterSet = cs;
+                        d.storageMode = MTLStorageModeShared;
+                        d.sampleCount = 512;
+                        NSError* err = nil;
+                        g_seg.sb = [impl_->dev newCounterSampleBufferWithDescriptor:d error:&err];
+                    }
+            }
+            g_seg.ok = g_seg.sb != nil;
+            mach_timebase_info_data_t tb;
+            mach_timebase_info(&tb);
+            g_seg.tick_ns = (double) tb.numer / (double) tb.denom;
+            if (!g_seg.ok) std::fprintf(stderr, "mtl: STRATA_METAL_SEG_TIMING: no stage-boundary timestamp counters on this GPU\n");
+        }
+        const bool tm = timed && timing && g_seg.ok && 2 * (cuts.size() + 1) <= 512;
+        std::vector<uint64_t> h_seen(cuts.size()), h_rel(cuts.size());
+        MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
+        const uint64_t m0 = tm ? mach_absolute_time() : 0;
+        if (tm) [impl_->dev sampleTimestamps:&c0 gpuTimestamp:&g0];
         if (impl_->ev == nil) impl_->ev = [impl_->dev newSharedEvent];
         id<MTLSharedEvent> ev = impl_->ev;
         const uint64_t base = impl_->ev_v;
@@ -1013,7 +1152,17 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
         size_t i = 0;
         for (size_t s = 0; s <= cuts.size(); ++s) {
             const size_t end = s < cuts.size() ? (size_t) cuts[s] : ds.size();
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            id<MTLComputeCommandEncoder> enc;
+            if (tm) {
+                MTLComputePassDescriptor* pd = [MTLComputePassDescriptor computePassDescriptor];
+                pd.dispatchType = MTLDispatchTypeConcurrent;
+                pd.sampleBufferAttachments[0].sampleBuffer = g_seg.sb;
+                pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * s;
+                pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * s + 1;
+                enc = [cb computeCommandEncoderWithDescriptor:pd];
+            } else {
+                enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            }
             const size_t first = i;
             for (; i < end; ++i) {
                 if (i > first && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1031,14 +1180,47 @@ double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector
             while (ev.signaledValue < want) {
                 if (cb.status >= MTLCommandBufferStatusCompleted) break;   // an error: the wait below reports it
             }
+            if (tm) h_seen[s] = mach_absolute_time();
             at_cut(user, (int) s);
+            if (tm) h_rel[s] = mach_absolute_time();
             ev.signaledValue = base + 2 * s + 2;
         }
         impl_->ev_v = base + 2 * cuts.size() + 2;
         [cb waitUntilCompleted];
+        if (warm) warm_set(impl_->dev, false);
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
             std::exit(5);
+        }
+        if (tm) {
+            const uint64_t m1 = mach_absolute_time();
+            [impl_->dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+            NSData* d = [g_seg.sb resolveCounterRange:NSMakeRange(0, 2 * (cuts.size() + 1))];
+            const MTLCounterResultTimestamp* ts = d ? (const MTLCounterResultTimestamp*) d.bytes : nullptr;
+            if (ts && g1 > g0 && m1 > m0) {
+                // a GPU timestamp onto the host's mach clock: linear between the two (mach, GPU) samples
+                const double k = (double) (m1 - m0) / (double) (g1 - g0);
+                auto host_of = [&](uint64_t g) { return (double) m0 + ((double) g - (double) g0) * k; };
+                const double tn = g_seg.tick_ns;
+                ++g_seg.windows;
+                for (size_t s = 0; s <= cuts.size(); ++s) {
+                    const double gs = host_of(ts[2 * s].timestamp), ge = host_of(ts[2 * s + 1].timestamp);
+                    g_seg.exec_ns += (ge - gs) * tn;
+                    if (s < cuts.size()) {
+                        ++g_seg.cuts;
+                        const double hs = (double) h_seen[s], hr = (double) h_rel[s];
+                        const double nx = host_of(ts[2 * (s + 1)].timestamp), nxe = host_of(ts[2 * (s + 1) + 1].timestamp);
+                        g_seg.detect_ns += (hs - ge) * tn;
+                        g_seg.host_ns += (hr - hs) * tn;
+                        g_seg.resume_ns += (nx - hr) * tn;
+                        const int b = turn_bucket((hr - hs) * tn / 1e6);
+                        ++g_seg.bn[b];
+                        g_seg.bhost[b] += (hr - hs) * tn;
+                        g_seg.bresume[b] += (nx - hr) * tn;
+                        g_seg.bexec[b] += (nxe - nx) * tn;
+                    }
+                }
+            }
         }
         return cb.GPUEndTime - cb.GPUStartTime;
     }

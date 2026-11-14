@@ -79,18 +79,19 @@ private:
     struct Lay { uint64_t g, gs, u, us, d, ds; int cls; };
     struct Slot { int16_t layer = -1; int16_t e = -1; int prev = -1, next = -1; bool pre = false; int left = 0; uint64_t pin = 0; std::atomic<int> state{0}; };  // 0 idle, 1 queued, 2 reading
     struct Cls { uint64_t pages = 0; int n = 0; int base = 0; int head = -1, tail = -1; };  // slot range [base, base+n)
-    struct Job { int slot; int layer, e, part; };   // part: slice * split_ + piece
+    // part: slice * split_ + piece; cache: read through the page cache; kind: 0 prompt, 1 decode miss, 2 read-ahead or fill
+    struct Job { int slot; int layer, e, part; bool cache; int8_t kind; };
     void lru_unlink(int s);
     void lru_front(int s);
     void lru_back(int s);
     int cls_of(int s) const;
     int victim(int cls);
-    void read_part(int slot, int l, int e, int part);
+    void read_part(int slot, int l, int e, int part, bool cache);
     void cancel_slot(int s);
     void promote_slot(int s);
     void io_main();
     void ahead(int ln, int T, const float* pred, int K);
-    void submit(int slot, int l, int e, bool urgent);
+    void submit(int slot, int l, int e, bool urgent, bool cache, int kind);
     void wait_slot(int s);
     uint8_t* standalone_region(uint64_t bytes);   // the prompt's buffers as their own allocation, when no region of the arena's slots takes them
 
@@ -99,6 +100,15 @@ private:
     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
     int cfd_ = -1;
+    // STRATA_METAL_PAGE_CACHE (opt-in): 1 = the decode's misses and read-aheads are read through macOS's file cache (a second,
+    // elastic expert tier: a miss the file cache still holds is a memory copy, not an SSD read; the cache's pages are clean and
+    // macOS drops them under pressure instead of compressing or swapping them); 2 = every read, prompts included.  The fds
+    // below are the same files without F_NOCACHE; the default (0) reads everything with F_NOCACHE, as before.
+    int fd_c_ = -1, cfd_c_ = -1;
+    int page_cache_ = 0;
+    // STRATA_METAL_ROUTE_TRACE=<path> (test tooling): every handshake's routed ids (and the read-ahead's predicted top 16 per
+    // token for the next layer), appended as binary records for offline cache/prefetch simulation
+    FILE* trace_ = nullptr;
     std::vector<uint64_t> coff_;
     std::vector<Lay> lay_;
     std::vector<Cls> cls_;
@@ -119,6 +129,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::deque<Job> urgent_q_, pre_q_;
+    int pre_inflight_ = 0;   // decode read-aheads being read now (STRATA_METAL_IO_RESERVE)
     bool stop_ = false;
     int outstanding_ = 0;
     int nio_ = 6, pre_k_ = 10, pre_k2_ = 0, split_ = 2;
@@ -129,6 +140,10 @@ private:
     double p_wait_ms_ = 0, p_host_ms_ = 0;
     uint64_t lookups_ = 0, hits_ = 0, pre_hits_ = 0, late_ = 0, misses_ = 0, pre_issued_ = 0, pre_cancel_ = 0, windows_ = 0;
     std::atomic<uint64_t> bytes_read_{0}, reads_{0};
+    // how long each read took (one piece of an expert), by origin: [0] prompt, [1] decode urgent, [2] read-ahead / fill;
+    // buckets < 0.1, 0.2, 0.4, 0.8, 1.6 ms and longer (a read under ~0.12 ms of a 2 MB expert is the file cache's copy)
+    std::atomic<uint64_t> lat_[3][6] = {};
+    std::atomic<uint64_t> lat_us_[3] = {};
     double wait_ms_ = 0, host_ms_ = 0, fill_s_ = 0;
     uint64_t fill_bytes_ = 0;
 };
