@@ -57,6 +57,10 @@ static inline device const uchar* arena_slot(uint v, device const uchar* W, devi
 }
 #endif
 
+// Experimental remote expert ownership. Unset: the original bindings and local execution are unchanged.
+constant bool kNetworkExpertsFc [[function_constant(30)]];
+constant bool kNetworkExperts = is_function_constant_defined(kNetworkExpertsFc) && kNetworkExpertsFc;
+
 static inline void plan_body(device const int* ids, device const float* w, device int* plan, constant MoeArgs& a,
                              ushort tid, ushort nth, ushort sg, ushort lane, threadgroup int* s_grp,
                              threadgroup int* s_ent) {
@@ -209,19 +213,21 @@ kernel void moe_gu(device const uchar* W [[buffer(0)]], device const float* x [[
                    constant MoeArgs& a [[buffer(4)]], device const float* xs16 [[buffer(5)]],
                    device const uint* smap [[buffer(6)]], device const uchar* W1 [[buffer(7)]],
                    device const uchar* W2 [[buffer(8)]], device const uchar* W3 [[buffer(9)]],
+                   device const uint* owned [[buffer(10)]],
                    uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
                    ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int RG = 32 / LPR;
+    const int g = int(tg.y);
+    if (g >= plan[P_NG]) return;
+    const ulong ex = (ulong)plan[P_GEXP + g];
+    if (kNetworkExperts && owned[ex] != 0) return;   // uniform for the whole group, before any expert address/read
     threadgroup uint tab[fmt<F>::TAB];
     if (moe_probe != 1) {
         load_tab<F>(tab, tid, SG * 32);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const int g = int(tg.y);
-    if (g >= plan[P_NG]) return;
     const int li = lane % LPR;
     const int row0 = ((int(tg.x) * SG + sg) * RG + lane / LPR) * NR;
-    const ulong ex = (ulong)plan[P_GEXP + g];
     const int c = plan[P_GSTART + g], ne = plan[P_GSTART + g + 1] - c;
     device const int* etok = plan + P_ETOK + c;
     device const uchar* E = kArena ? arena_slot(smap[ex], W, W1, W2, W3) : W + ex * a.gu_stride;
@@ -276,17 +282,19 @@ kernel void moe_down(device const uchar* W [[buffer(0)]], device const float* h 
                      constant MoeArgs& a [[buffer(4)]], device const float* hs16 [[buffer(5)]],
                      device const uint* smap [[buffer(6)]], device const uchar* W1 [[buffer(7)]],
                      device const uchar* W2 [[buffer(8)]], device const uchar* W3 [[buffer(9)]],
+                     device const uint* owned [[buffer(10)]],
                      uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int RG = 32 / LPR;
+    const int g = int(tg.y);
+    if (g >= plan[P_NG]) return;
+    const ulong ex = (ulong)plan[P_GEXP + g];
+    if (kNetworkExperts && owned[ex] != 0) return;
     threadgroup uint tab[fmt<F>::TAB];
     load_tab<F>(tab, tid, SG * 32);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int g = int(tg.y);
-    if (g >= plan[P_NG]) return;
     const int li = lane % LPR;
     const int row0 = ((int(tg.x) * SG + sg) * RG + lane / LPR) * NR;
-    const ulong ex = (ulong)plan[P_GEXP + g];
     const int c = plan[P_GSTART + g], ne = plan[P_GSTART + g + 1] - c;
     device const uchar* d0 = (kArena ? arena_slot(smap[ex], W, W1, W2, W3) : W + ex * a.d_stride) + a.down_off + (ulong)row0 * a.d_row;
     switch (ne) {

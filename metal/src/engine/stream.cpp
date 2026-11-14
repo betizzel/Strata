@@ -97,7 +97,7 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
             if (ok) {   // spot check: layer 0's first and layer 47's last expert, every slice
                 for (const int l : {0, NL - 1}) {
                     const Lay& x = lay_[(size_t) l];
-                    const int e = l == 0 ? 0 : NE - 1;
+                    const int e = l == 0 ? (int) owned_prefix_ : NE - 1;
                     std::vector<uint8_t> a(x.gs + x.us + x.ds), b(a.size());
                     ok = ok && ::pread(cfd, a.data(), a.size(), (off_t) (off[(size_t) l] + (uint64_t) e * a.size())) == (ssize_t) a.size() &&
                          ::pread(fd_, b.data(), x.gs, (off_t) (x.g + (uint64_t) e * x.gs)) == (ssize_t) x.gs &&
@@ -369,7 +369,8 @@ void ExpertStream::promote_slot(int s) {
 }
 
 bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::string& profile, int min_slots, std::string& err,
-                              const std::function<uint64_t()>& recheck, const std::function<bool(uint64_t)>& grow) {
+                              const std::function<uint64_t()>& recheck, const std::function<bool(uint64_t)>& grow,
+                              uint64_t max_bytes) {
     const double t0 = now_ms();
     shrink_to_ = 0;
     for (auto& k : cls_) k.n = 0;   // a second try (after a shrink) lays the arena out again
@@ -384,7 +385,7 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
             for (uint32_t i = 0; i < h[4]; ++i) {
                 uint16_t p[2];
                 if (std::fread(p, 2, 2, f) != 2) break;
-                if (p[0] < NL && p[1] < NE && !seen[(size_t) p[0] * NE + p[1]]) {
+                if (p[0] < NL && p[1] < NE && p[1] >= owned_prefix_ && !seen[(size_t) p[0] * NE + p[1]]) {
                     seen[(size_t) p[0] * NE + p[1]] = 1;
                     rank.push_back({p[0], p[1]});
                 }
@@ -395,7 +396,7 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
         std::fprintf(stderr, "strata metal stream: no expert profile at %s: the arena starts layer-interleaved\n", profile.c_str());
     }
     const size_t from_profile = rank.size();
-    for (int e = 0; e < NE; ++e)
+    for (int e = (int) owned_prefix_; e < NE; ++e)
         for (int l = 0; l < NL; ++l)
             if (!seen[(size_t) l * NE + e]) rank.push_back({l, e});
     // the pool of each size class: at least min_slots (a prompt chunk's layer needs up to 512 at once), then the
@@ -424,6 +425,10 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
     for (const auto& k : cls_) {
         total += (uint64_t) k.n * k.pages * PAGE;
         biggest = std::max<uint64_t>(biggest, k.pages * PAGE);
+    }
+    if (max_bytes && total > max_bytes) {
+        err = "metal stream: the minimum expert arena layout exceeds STRATA_METAL_ARENA_MAX_GB";
+        return false;
     }
     uint64_t want = std::max<uint64_t>(8ull << 30, total / 4 + 4 * biggest);
     if (const char* e = std::getenv("STRATA_METAL_ARENA_CHUNK_GB")) want = (uint64_t) (std::atof(e) * (1ull << 30));
@@ -580,7 +585,7 @@ void ExpertStream::ahead(int ln, int T, const float* pred, int K) {
         const float* lg = pred + (size_t) t * NE;
         int top[32];
         int nt = 0;
-        for (int e = 0; e < NE; ++e) {
+        for (int e = (int) owned_prefix_; e < NE; ++e) {
             if (nt < K) { top[nt++] = e; continue; }
             int m = 0;
             for (int j = 1; j < K; ++j) if (lg[top[j]] < lg[top[m]]) m = j;
@@ -624,7 +629,7 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
     int nw = 0;
     for (int i = 0; i < T * topk; ++i) {
         const int e = ids[i];
-        if (e < 0 || e >= NE || used[e]) continue;
+        if (e < (int) owned_prefix_ || e >= NE || used[e]) continue;
         used[e] = true;
         want[nw++] = e;
     }
@@ -694,7 +699,7 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
             bool any = false;
             std::lock_guard<std::mutex> g(mu_);
             const int ln = l + 1;
-            for (int e = 0; e < NE; ++e) {
+            for (int e = (int) owned_prefix_; e < NE; ++e) {
                 if (where_[(size_t) (ln * NE + e)] >= 0) continue;
                 const int s = victim(lay_[(size_t) ln].cls);
                 if (s < 0) break;

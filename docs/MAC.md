@@ -8,7 +8,8 @@ own engine, separate from the Qwen one described on this page.
 
 > **On this page:** [What you need](#what-you-need) · [Install](#install) · [Defaults](#defaults-and-options) ·
 > [Gyro](#gyro-s-and-gyro-m-agentionais-trellis-experts) · [Measured](#measured-m5-max-128-gb) · [Limits](#limits-this-version) ·
-> [Switches](#switches) · [How it works](#how-it-works) · [History](#history--older-measurements)
+> [Switches](#switches) · [Network experts](#experimental-network-expert-worker-local-source-build) ·
+> [How it works](#how-it-works) · [History](#history--older-measurements)
 
 ## Quick start
 
@@ -76,6 +77,310 @@ The engine streams the experts from the SSD. It decides this itself when the exp
   sets it.
 - The model's file must be on the internal SSD. An external disk is untested and likely much slower.
 
+### Local IQ3_S cache trial (M5 Pro, 48 GiB, 2026-11-12)
+
+The isolated `build-metal-cache/strata` build adds `STRATA_METAL_ARENA_MAX_GB`: a ceiling on automatic sizing,
+not a forced allocation. It keeps the shrink and stepped-fill checks; the engine rejects a minimum slot layout
+that exceeds the ceiling. Do not combine it with `STRATA_METAL_ARENA_GB`, which bypasses those checks.
+The Metal server now prints its expert-stream counters on orderly shutdown, before `_Exit` skips its exit handlers.
+
+Five sequential arms completed 20 requests with 4K context, greedy sampling, 1024-token prompt chunks,
+MTP/suffix drafting and prompt reuse off, all routed experts and the existing refusal projection unchanged.
+Requested ceilings were 8, 12 and 16 decimal GB; actual arenas ranged from 8.00 to 14.33 GB as available memory changed.
+The GPU ceiling was 43008 MiB, with 10 decimal GB kept for macOS. All sampled pressure was normal;
+swap increased 2.25 MiB and reported free memory stayed at or above 35%.
+
+At nearly equal actual arenas, the original layout (9.50 GB) read the 3041-token prompt in a mean 11.98 s;
+the byte-identical contiguous sidecar (9.58 GB) took 7.22 s. Code decode medians were 12.87 and 13.02 tokens/s.
+This is about 40% less prompt time, not a comparable decode improvement or a long-context guarantee.
+The sidecar's 8.00 and 14.33 GB arms reported cache hit fractions of 70.24% and 82.39%, but the short,
+sequential trials do not establish an optimal cache size. Outputs matched across corresponding requests;
+the generated prime functions passed 13 cases each and all retrieval answers were correct.
+Disk caches were not purged, and the first request includes deferred engine initialization.
+
+Raw results, the bounded runner, output checks and build/test logs:
+`~/Developer/ai-switch/results-expert-cache-20261112-114154/`. The sidecar remains isolated in
+`~/Developer/ai-switch/results-flash-iq3s-resume-20261112-003906/`; the production binary and profile were not replaced.
+
+### Follow-on server tuning (same Mac, 2026-11-12)
+
+The next isolated experiment completed 102 requests with the same IQ3_S target, refusal projection and routed experts.
+All completed requests with identical inputs returned identical tokens across modes. Prime functions passed 13 cases each;
+retrieval and copied JSON matched their expected answers. The prose pair was reviewed and matched token for token.
+These are small greedy text fixtures, not a broad quality benchmark, vision test or server soak.
+
+| Comparison | Control | Candidate |
+| --- | --- | --- |
+| 12,041-token fresh prompt, Metal chunks 1024 versus 4096 | 27.50–28.83 s | 18.29 s |
+| Short Python function, no drafter versus native MTP `--spec 4` | 14.28–14.60 tok/s | 27.65 tok/s |
+| JSON copying, no drafter versus native MTP `--spec 4` | 17.06–17.34 tok/s | 33.45 tok/s |
+| Short prose, matched 64K-configured engines, MTP off versus on | 14.72 tok/s | 17.94 tok/s |
+
+The short decode sweep used 4K context and two measured repetitions. The prose pair used one request per arm.
+Automatic arena sizes varied: these are sequential end-to-end measurements, not a fixed-residency kernel comparison.
+Suffix lookup alone helped copying (24.74 tok/s) but not the prime function; adding it to MTP did not show a clear gain.
+
+The combined test kept 4096-token chunks, a 12 decimal GB automatic arena ceiling, a 10 GB reserve and 65,536 context.
+With MTP off/on, the fresh 65,441-token prompt took 103.06/115.59 s: MTP sped up longer output, but cost cold prompt time.
+Both then answered the 65,475-token follow-up correctly, with first-token latency 1.27/1.35 s.
+The plain/MTP paths reused 65,448/65,449 tokens, reading only 27/26 new tokens. This is existing conversation caching,
+not a newly enabled production feature. Disk caches were not purged. The code and prose tests used fresh short inputs,
+not long generations at the end of the 65K prompt.
+
+Higher arena ceilings were not a free win. Two 20 GB-ceiling fills hit macOS warning pressure and were stopped without
+additional swap growth; higher arms were skipped. One had allocated 15.21 GB, the other stopped during a 12.7 GB plan.
+This is not a hard 16 GB hardware threshold. Wiring a smaller arena succeeded, but its modest speed difference was
+confounded by a larger actual cache; wiring after the fill did not remove fill-time pressure risk. It is not recommended
+as a new default from this evidence. Across the monitored model trials, swap never exceeded the starting 4358.75 MiB.
+
+Native MTP needs Strata's tensor layout, not a llama.cpp `blk.48.*` draft GGUF. The existing fetch/pack tools prepared
+the default Q2_0 **draft-only** experts from pinned source `de4b8e4d43b917e7706784d8bb445c9af86a3540` (about 0.89 GB packed).
+The main IQ3_S weights were not requantized. Use `STRATA_METAL_MTP_GGUF` for an explicit draft filename and enable
+`mtp` in the server config as well as `--mtp`; an explicit `mtp: false` strips the argument. A native Q4_0 draft attempt
+found missing Metal expert kernel entrypoints and was not used for performance claims.
+
+Results, failed trials, raw outputs, source/asset provenance, bounded runner and two tested profile choices:
+`~/Developer/ai-switch/results-efficiency-20261112-1157/`. `candidate.json` distinguishes output-heavy MTP chat from
+MTP-off long-input/short-output requests. The benchmark kept one conversation checkpoint and disabled parked conversations;
+it did not validate production's multi-conversation cache policy, stochastic sampling, thinking, tools or vision.
+No production binary/profile was replaced. The 43008 MiB GPU limit is unchanged; all managed models were left unloaded.
+
+
+## Experimental network expert worker (local source build)
+
+This checkout has an opt-in Qwen Flash-Next expert worker. It is not part of the released Strata package and is not
+llama.cpp's layer RPC. The Mac keeps routing, attention, KV state, shared experts and its local routed experts on Metal.
+A separate CUDA process computes a fixed prefix of routed expert IDs in every layer. Those weights are held in the PC's
+anonymous system RAM; a bounded VRAM cache stages requested experts from that RAM. During inference the network carries
+normalized activations and unweighted expert results, not weight blobs. The Mac applies each router weight once.
+
+The implemented geometry is the plain-basis, 48-layer Qwen Flash-Next native IQ3_S pack: embedding 2560, expert width 640,
+512 experts per layer, ten routed experts per token. It does not support DeepSeek, folded Hadamard experts, tensor
+parallelism or remote attention state. Prompts deliberately use the existing windows of at most eight tokens rather than
+the local prompt-GEMM path. Speculative verification uses the same windows. The normal path is unchanged when
+`STRATA_NETWORK_EXPERTS` is unset.
+
+### Build and prepare the PC-owned weights
+
+Run from this source checkout, after its normal Metal dependencies have been prepared:
+
+```sh
+cmake -S metal -B build-metal-network -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DMETAL_CPP_DIR="$PWD/third_party/metal-cpp" \
+  -DSTRATA_GGML_DIR="$PWD/third_party/llama-pinned"
+cmake --build build-metal-network --target strata expert_parity -j 4
+
+MODEL="$HOME/Developer/Strata-new-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+EXPERTS="$HOME/Developer/Strata-network-data/iq3_s-prefix128.strnexp"
+python3 tools/network_experts/export.py --gguf "$MODEL" --out "$EXPERTS" --experts 128
+```
+
+The exporter reads the existing GGUF header and raw gate/up/down slices. It does not requantize or alter the source files.
+The source must have its verified `sha256 ...` `.done` marker. It writes a separate file and checksum, and refuses to
+overwrite an existing output. With 128 owned experts per layer the payload is 12,573,081,600 bytes (11.710 GiB),
+representing 6,144 experts. Keep this derived file on the PC; remove the temporary Mac copy after verifying its transfer.
+
+For the tested CUDA PC (an SSH alias `pc` here), prepare isolated directories and copy only the worker's source closure:
+
+```sh
+ssh pc 'mkdir -p ~/Strata-network-src ~/Strata-network-data'
+rsync -rlpRc include/ src/kernels/cuda/ third_party/ggml/ third_party/ggml-tq/ \
+  tools/network_experts/ LICENSE pc:Strata-network-src/
+rsync -a "$EXPERTS" "$EXPERTS.sha256" pc:Strata-network-data/
+ssh pc 'env -C ~/Strata-network-data sha256sum -c iq3_s-prefix128.strnexp.sha256'
+ssh pc 'cmake -S ~/Strata-network-src/tools/network_experts \
+  -B ~/Strata-network-src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc && \
+  cmake --build ~/Strata-network-src/build --target strata-network-experts -j 2'
+```
+
+Source synchronization intentionally does not preserve timestamps: future-dated source files on a PC with a slower clock
+cause Ninja to regenerate continuously. The tested PC used CUDA 13.4, GCC 16.2 and an RTX 2070 Super (sm_75).
+
+### Run and verify
+
+Start the private worker through an SSH tunnel:
+
+```sh
+ssh -tt -o BatchMode=yes -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:50554:127.0.0.1:50054 pc \
+  'exec flock -n -F /tmp/strata-network-expert-memory.lock \
+   ~/Strata-network-src/build/strata-network-experts \
+   --weights ~/Strata-network-data/iq3_s-prefix128.strnexp \
+   --port 50054 --ram-mib 13312 --vram-mib 5120'
+```
+
+The worker binds loopback only. Do not expose this protocol as a public service. Its RAM cap covers the actual expert
+allocation, not CUDA context or staging overhead. Startup also requires 8 GiB of available host-RAM headroom and checks
+that reserve while loading. The weights are pageable anonymous memory, not locked memory: external memory pressure can
+still make Linux swap them. The VRAM budget covers cache slots; fixed buffers and the CUDA context are additional.
+
+In another terminal, compare real CUDA outputs with Metal, including the local ownership-mask skip and weighted merge:
+
+```sh
+MODEL="$HOME/Developer/Strata-new-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+build-metal-network/expert_parity --gguf "$MODEL" --layer 17 --ntok 8 \
+  --network-endpoint 127.0.0.1:50554
+```
+
+The verified matrix uses layers `0,1,2,12,17,21,47`, each at one and eight tokens, covering every actual IQ3_S quant pair.
+The existing Metal-versus-double checks remain active. CUDA uses the native Q8 activation arithmetic, so CUDA/Metal
+results are not bit-identical; the network check bounds weighted-row and mixed-merge error at relative L2 0.03 and
+maximum error relative to peak reference 0.06. It also verifies that remotely assigned rows are not computed locally.
+
+For the Mac engine, set `STRATA_NETWORK_EXPERTS=127.0.0.1:50554` and `STRATA_METAL_STREAM=1`, using the separate
+`build-metal-network/strata` binary. Keep the regular `--native`, `--ple-gguf`, `--pack`, `--mmap-experts`,
+`--expert-profile`, `--expert-cache`, `--prefill` and `--spec` arguments; a native CLI run requires `--spec` of at least two.
+`STRATA_ROUTE_TAIL_SKIP=0` preserves all ten routed experts. `STRATA_METAL_ARENA_GB=24` was used for the bounded trial;
+it is not a new production default. The engine's report gives completed remote requests, expert rows and network bytes.
+The worker reports its real RAM allocation/RSS, VRAM cache, hits, misses and PC-RAM-to-GPU upload bytes.
+
+In that same terminal, this complete short-generation command uses the tested settings. The supplied prompt asks for
+37 + 59; the observed output IDs `24 21 248046` decode to `96` followed by the end-of-turn marker.
+
+```sh
+PACK="$HOME/Developer/Strata-new-data/packs/iq3_s"
+PLE="$HOME/Developer/Strata-new-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"
+env STRATA_NETWORK_EXPERTS=127.0.0.1:50554 STRATA_METAL_STREAM=1 \
+  STRATA_ROUTE_TAIL_SKIP=0 STRATA_METAL_ARENA_GB=24 \
+  build-metal-network/strata --pack "$PACK" --native "$MODEL" --ple-gguf "$PLE" \
+  --expert-profile data/expert-profile.bin --expert-cache 64 --mmap-experts \
+  --prefill 64 --spec 2 --suffix-draft 0 --max-context 1024 --max-new 8 --stop-eos \
+  --tokens 248045,846,198,44712,220,18,22,478,220,20,24,13,17308,440,1132,279,7308,13,248046,198,248045,74455,198,248068,271,248069,271 \
+  --stats
+```
+
+A failed remote contribution cannot become a successful partial answer. The submitted Metal graph is drained safely and
+the engine rejects the failed session; reload the engine before using it again. The worker accepts a fresh connection.
+No production alias, server port or launch agent is changed by this experiment. Short Wi-Fi runs establish operation,
+not Ethernet performance, long-context quality, vision or projection/abliteration parity.
+
+The initial 96-expert, 24 GB-arena Wi-Fi trial used a 48 GB M5 Pro and the RTX 2070 Super PC. A 67-token coding prompt
+generated an 89-token `is_prime` function at 1.82 engine-reported tokens/s; executing it passed 12 negative, boundary, prime,
+composite and square cases. That request completed 4,646 remote calls covering 22,047 expert rows. The arithmetic smoke
+matched the local-only output IDs. Killing the worker during a real prompt caused a clean nonzero exit with an explicit
+disconnect error; restarting the worker and reloading the engine restored the arithmetic result.
+
+### Saved performance runner
+
+The repeatable setup uses `tools/network_experts/cluster.py` and the machine profile
+`~/Developer/Strata-network-data/iq3s-mac-pc.json`. It is an opt-in command, not an always-on production service.
+It owns its native engine and SSH worker, checks that ai-switch is idle, and releases those processes on completion,
+failure or interruption. A local memory lock and PC worker lock prevent overlapping instances. Run it while both devices
+are otherwise idle; it does not register a new ai-switch service or prevent somebody from starting another AI app.
+No production alias, key, run configuration, daemon or launch agent is replaced.
+
+The saved cases use the same experimental binary, 4K text context, greedy sampling, a spec limit of two and 32 GB
+requested Mac expert arena. MTP is off, matching the production run config; native `DONE` recorded no draft tokens.
+The allocator can reduce the arena to preserve its memory reserve. Prompt and conversation caching are disabled.
+The production config supplies the model and per-layer refusal-direction projection arguments, but no API key is
+copied into artifacts. Cases cover Mac-only, 256 MiB and 5 GiB CUDA caches through the SSH alias, and a separate 5 GiB
+direct-LAN case. All distributed cases assign expert IDs 0–127 in every layer to PC RAM.
+
+The `pc` alias resolved to the PC's Tailscale address, whose observed direct underlay was the PC's LAN address rather
+than a relay. The `remote128-lan-cache5120` case sets `ssh_hostname` to that LAN address.
+That optional profile/variant field overrides only OpenSSH's target address, preserving the alias's user, port and
+host-key checks. No SSH or Tailscale configuration is changed. For a future cable test, set it to the PC's wired IP and
+verify the actual SSH route and negotiated link speed before comparing results.
+
+This arena is close to the Mac's GPU working-set cap; a local run reported under 512 MiB free VRAM. The PC also had
+nearly full system swap after the comparisons. Workers were released, not made boot services, and no swap reset or
+forced eviction of other programs was attempted. If memory pressure appears, lower the selected variant's
+`mac_arena_gb` or PC ownership/cache budget and rerun the comparison; do not infer extra memory from the Mac's GPU limit.
+
+```sh
+SRC="$HOME/Developer/Strata-ablation-src"
+PY="$HOME/.local/share/strata/terminal/0.1.54/python/bin/python3"
+PROFILE="$HOME/Developer/Strata-network-data/iq3s-mac-pc.json"
+OUT="$HOME/Developer/Strata-network-data/perf-$(date +%Y%m%d-%H%M%S)"
+"$PY" "$SRC/tools/network_experts/cluster.py" --profile "$PROFILE" bench \
+  --repetitions 2 --max-tokens 96 --output "$OUT"
+"$PY" "$SRC/tools/network_experts/report.py" "$OUT" --gbps 1 --gbps 2.5 \
+  --rtt-ms 0.2 --rtt-ms 0.8 --out "$OUT/analysis.json" --markdown "$OUT/report.md"
+```
+
+For a custom prompt, use `run --variant remote128-lan-cache5120 --prompt 'your prompt' --max-tokens 96 --output NEW_DIR`.
+For an instrumentation-overhead comparison, run the same selected benchmark case with `--no-trace` and a new output
+directory. The profile's Python path is used automatically, preserving its installed tokenizer/template dependencies.
+The output directory must be new: existing results are never overwritten.
+
+Each case keeps its engine resident across repetitions. Results include exact returned token IDs/text, individual
+token-arrival timestamps, native `DONE` statistics, engine/worker logs, before/after application probes and buffered JSONL
+request/window traces. Window markers associate observed tokens with completed GPU windows. A failed request is recorded
+as failed, returns nonzero and is not silently retried. The reporter refuses unfinished or failed measurements.
+
+Timing definitions:
+
+- Engine startup ends at native `READY`. The first request may still fill/compile the Metal window and arena; that
+  deferred work is part of its cold time to first token (TTFT), not steady decode.
+- TTFT runs from the actual native `GEN` write to the first yielded token. Decode rate uses the first-to-last arrival
+  interval and `N-1` observed token intervals, not the requested output limit. Terminal tokens count; heartbeats do not.
+  Speculative tokens can arrive in bursts. These figures are not directly comparable to the initial CLI's aggregate rate.
+- A request normally hands off one layer's expert activations, not an entire generated token. Several dozen such calls
+  can lie on a token's path. Request lifetime is send time + local-work overlap + exposed result wait, not bare network RTT.
+- CUDA event intervals report the H2D stage, quantization/full expert computation and D2H. H2D includes pageable-upload
+  enqueue gaps. Host preparation overlaps that stage; do not add it to GPU durations or the inclusive worker service time.
+  All durations use local monotonic clocks; no comparison of unsynchronized Mac and PC wall-clock timestamps is needed.
+- Empty and size-matched no-compute probes use the same HELLO-gated SSH/TCP connection as inference, before and after the
+  engine runs. They do not compute experts or alter its cache. The worker permits one client at a time.
+- Ethernet scenarios hold measured routing, cache behavior, CPU/CUDA work, local overlap and untraced work fixed. Only
+  exposed wait is reduced. The probe-calibrated estimate preserves unexplained waits; the optimistic estimate attributes
+  removable waits to the current link. Assumed application RTT includes SSH/dispatch overhead, with 90% payload efficiency.
+  Neither is a wired measurement or a statistical confidence interval.
+
+The physical route is Mac Wi-Fi (`en0`) to the PC's `enp6s0`, currently negotiated at 1 Gbit/s. The PC's Intel I225-V
+controller supports up to 2.5 GbE ([Intel specifications](https://www.intel.com/content/www/us/en/products/details/ethernet/gigabit-controllers/i225-controllers/products.html)).
+A direct 2.5 GbE scenario requires a compatible Mac adapter/cable and successful link negotiation; faster scenarios
+require suitable interfaces at both ends. No measured wired speed or long-context/vision quality is implied.
+
+
+### Measured performance of the saved setup
+
+The local comparison used the M5 Pro, 48 GB unified memory, RTX 2070 Super 8 GiB and PC system RAM described above.
+Every case ran the two saved prompts twice, with a 96-token output limit, 4K context and runtime projection enabled.
+Each case returned 370 tokens. These were sequential snapshots, not a randomized test with Wi-Fi conditions held fixed.
+Aggregate rates use the total observed token intervals divided by their total duration.
+
+| Case | Aggregate decode tokens/s |
+|---|---:|
+| Mac only, 32 GB expert arena | 19.19 |
+| Wi-Fi + Tailscale SSH, 256 MiB CUDA cache | 2.24 |
+| Wi-Fi + Tailscale SSH, 5 GiB CUDA cache | 2.21 |
+| Wi-Fi + explicit LAN SSH, 5 GiB CUDA cache | 2.48 |
+| Wi-Fi + Tailscale SSH, 5 GiB cache, profiling off | 2.26 |
+
+The four profiling-off runs returned exactly the same token IDs as the matching profiled runs. Their rate difference
+was small relative to the observed Wi-Fi run-to-run variation; it is not a controlled estimate of profiler overhead.
+The expanded projected model's returned `is_prime` function also passed 12 executed arithmetic/boundary cases.
+
+The 5 GiB cache achieved 88.5–94.4% hits across prompts, versus 0–3.9% with the small cache. On the explicit LAN-over-Wi-Fi
+route, each generated-token interval involved about 45.7 layer calls. Median empty application RTT was 3.99 ms, while
+actual expert-request median lifetimes were 6.38–6.48 ms. Median CUDA-worker service was 0.17–0.18 ms; the Mac still spent
+about 265–276 ms per token interval waiting for remote results. The cache improved worker service time, not overall
+Wi-Fi throughput clearly. A generated token is not a single network exchange.
+
+Using that explicit-LAN trace, 90% payload efficiency and assumed application base RTTs of 0.2–0.8 ms:
+
+| Future link | Probe-calibrated decode tokens/s | Optimistic decode tokens/s |
+|---|---:|---:|
+| 1 GbE | 4.26–4.70 | 6.14–7.11 |
+| 2.5 GbE | 4.41–4.81 | 6.47–7.36 |
+
+These ranges vary the assumed RTT; they are not confidence intervals or measured wired speeds. The optimistic column
+removes all wait attributed to the old link beyond replacement service. The calibrated column preserves unexplained
+waits. Both retain observed GPU work, local work and host overhead. This design extends usable memory; these results
+do not establish a speed advantage over the Mac alone. Reducing per-layer handoffs matters more than merely enlarging
+the CUDA cache.
+
+The detailed comparison is saved at
+`~/Developer/Strata-network-data/comparison-20261030-231810/report.md`, with complete JSON analysis, raw token timestamps,
+source-result paths and individual request traces. Original invocations retain their exact profile snapshots; the
+profiling-off control is at `~/Developer/Strata-network-data/perf-notrace-20261030-231810/`.
+The normal `flash-iq3s-64k-strata` router alias answered `96` to the arithmetic smoke without any worker running, then
+returned to its original unloaded state. The temporary Mac export and superseded PC 96-expert file were removed;
+the verified PC 128-expert file remains for repeat runs.
+
+
 ## Install
 
 For everyday use follow [the app or Terminal installation](INSTALL.md). The commands below are the source installation, which
@@ -111,6 +416,13 @@ API on `http://127.0.0.1:8080/v1`, the Anthropic API on `/v1/messages`, and the 
 | `--draft-vocab`, `--no-browser` | Draft vocabulary; do not open the browser. |
 | `--data-dir`, `--models-dir`, `--gguf-dir` | Where files go, or where yours are. |
 | `--setup`, `--no-start`, `--check`, `--build` | Choose another model or settings; install only; only check the Mac; build the engine again. |
+
+The Qwen Metal engine also accepts the engine's opt-in control-vector flags
+`--control-vector-scaled FILE:SCALE`, `--control-vector-layer-range A B`, `--cvec-mode add|project` and
+`--cvec-dir per-layer|single:L`. No vector is loaded by default. Projection applies after each selected layer's
+feed-forward write, for every residual stream during prompt processing and decoding. A loaded vector can be switched
+per request with the engine's `cvec=0|1` setting. These flags do not change the model files. This support is for the
+Qwen engine, not DeepSeek.
 
 ### The desktop app and `strata launch` on a Mac
 
@@ -223,7 +535,7 @@ from each other: top-1 agreement 95.4% against 95.8%, mean KL 0.0207 against 0.0
 - **Context:** measured up to 32K (needles, KL). Setup recommends 32K below 96 GB and 64K from 96 GB. Up to the model's 262K can
   be set, but it is not measured.
 - **One request at a time.** `--parallel` (batch slots) is not ported. Several clients queue.
-- **Not ported:** the control vector (`--control-vector-scaled`) and the PC tuning (`--calibrate`).
+- **Not ported:** the PC tuning (`--calibrate`).
 - **Streaming** is measured at 32 GB only.
 - **Families:** the original Qwen3.8-Flash-Next, Unsloth's UD-Q4/Q5/Q6_K_XL and agentionai's Gyro-S are measured. Setup repacks
   Unsloth's shards into one file for the GPU; a Gyro file is used as it is. The Swift and Coder releases are not set up on Mac
@@ -256,7 +568,8 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_PROMPT_EXPERTS=v3` | The M5 layout for the prompt's expert GEMMs. Fails on an M1 Max, so it is off there (default v2) |
 | `STRATA_METAL_STREAM=1` / `=0` | Stream the experts from the SSD even when the pack fits / never (the default decides by size) |
 | `STRATA_METAL_CONTIG=0` | Streaming: read the model file even when the experts' copy is there |
-| `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: the arena's size, or the memory left to macOS |
+| `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: force the arena's size (bypasses shrink/growth safeguards), or set the memory left to macOS |
+| `STRATA_METAL_ARENA_MAX_GB=N` | Streaming: cap automatic sizing in decimal GB while retaining memory safeguards; minimum 1 GB, cannot combine with `STRATA_METAL_ARENA_GB`; an oversized minimum slot layout fails before allocation |
 | `STRATA_METAL_LEAVE_SHARE=0.4` | Streaming, 64 GB or more: the share of the RAM left to macOS when the footprint cap is set |
 | `STRATA_METAL_WIRE_ARENA=0` | Streaming, 64 GB or more: leave the filled arena pageable (default: wired) |
 | `STRATA_METAL_IGNORE_REPACK=1` | Start although a model repack or setup's preparation is running (the engine refuses by default) |

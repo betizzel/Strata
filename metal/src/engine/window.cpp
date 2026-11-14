@@ -22,11 +22,14 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/network_experts.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +37,7 @@
 #include <cstring>
 #include <cerrno>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <signal.h>
 #include <unistd.h>
@@ -46,6 +50,7 @@
 #include <thread>
 #include <vector>
 
+namespace strata::kernels { void cvec_metal_bind_flag(int*); }
 namespace strata::gpu { uint64_t purge_device_allocations(size_t min_bytes); }   // metal/src/gpu/runtime.cpp
 
 namespace strata::metal_engine {
@@ -120,13 +125,15 @@ class Window {
 public:
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1, int max_t,
               int64_t max_cells, std::string& err);
-    bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
+    bool run(int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err,
+             const char* phase = "unknown");
     bool commit(int n_keep, std::string& err);
     bool finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0);
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
     bool streaming() const { return stream_; }
+    bool networked() const { return net_ != nullptr; }
     // --serve's conversation checkpoints: the window's running state (the GDN recurrences and conv histories, the
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err);
@@ -222,6 +229,9 @@ private:
     int lib_ = -1, lgdn_ = -1, lqsa_ = -1, lsmp_ = -1, lple_ = -1;
     std::map<std::string, mtl::Pipeline> pcache_;
     bool nb_ = false;
+    mtl::Buffer cvec_dir_, cvec_scale_, cvec_on_;
+    void cvec_write(std::vector<mtl::Dispatch>& ds, int layer, int n, const mtl::Buffer& R,
+                    const mtl::Buffer& bo, const mtl::Buffer& inj);
     int max_t_ = 1;
     int64_t max_cells_ = 0;
     int64_t n_vocab_ = 0;
@@ -265,7 +275,7 @@ private:
     // the encoded window per (T, head, hp_): built once, then only the positions are patched (the host's encode cost)
     struct Cached {
         std::vector<mtl::Dispatch> ds;
-        std::vector<int> cuts;                  // SSD streaming: the segment ends (one per layer, before its experts)
+        std::vector<int> cuts;                  // streaming: before experts; network mode also before combine
         std::vector<std::pair<int, int>> qsa;   // (dispatch, kind): 0 QsaArgs n_tok = T, 1 the merge (MAXT), 2 the scores
     };
     std::map<int, Cached> wcache_;
@@ -273,6 +283,20 @@ private:
     // ---- SSD streaming (stream.h): the dense weights in W_, the routed experts in the arena
     std::unique_ptr<ExpertStream> st_;
     bool stream_ = false, st_pred_ = false;
+    std::unique_ptr<strata::core::NetworkExperts> net_;
+    mtl::Buffer net_owned_;   // immutable per-layer ownership mask; never inferred from socket state
+    uint32_t net_prefix_ = 0;
+    std::array<strata::core::network::Job, MAXT * TOPK> net_jobs_{};
+    std::array<float, MAXT * TOPK> net_weights_{};
+    std::vector<float> net_results_;
+    size_t net_count_ = 0;
+    bool net_pending_ = false;
+    std::string net_io_error_;
+    char net_error_[4097] = {};
+    bool network_init(const std::string& endpoint, const std::string& shard1, std::string& err);
+    void network_begin(int layer);
+    void network_finish();
+    void network_fail(const char* message) noexcept;
     std::vector<int>* cuts_ = nullptr;
     mtl::Buffer predL_, predL2_;     // 48 x MAXT x 512: layer l + 1's (l + 2's) router logits from layer l's FFN input
     int seg_T_ = 0;
@@ -294,6 +318,7 @@ public:
     void stream_report(FILE* f) const {
         if (!st_) return;
         st_->report(f);
+        if (net_) net_->report(f);
         for (int t = 1; t <= MAXT; ++t)
             if (win_n_[t])
                 std::fprintf(f, "stream windows T=%d     %d (%s): %.2f ms each (GPU incl. the host's turns %.2f ms)\n", t, win_n_[t],
@@ -301,10 +326,7 @@ public:
     }
     int win_n_[MAXT + 1] = {};
     double win_ms_[MAXT + 1] = {}, win_gpu_[MAXT + 1] = {};
-    void at_cut(int s) {
-        st_->at_layer(s, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(), st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) s * MAXT * 512 : nullptr,
-                      predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) s * MAXT * 512 : nullptr);
-    }
+    void at_cut(int s);
 private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
     bool ple_on_ = false;
@@ -432,6 +454,140 @@ long repack_pid_running(const std::string& model_file) {
 }
 }  // namespace
 
+bool Window::network_init(const std::string& endpoint, const std::string& shard1, std::string& err) {
+    namespace network = strata::core::network;
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    if (!stream_) {
+        err = "metal network experts: streaming Qwen mode is required (set STRATA_METAL_STREAM=1)";
+        return false;
+    }
+    if (!layout.native || layout.n_layers != 48 || layout.n_expert != NEXP || layout.fmt.size() != 48 ||
+        strata::kernels::cpu::hadamard_spec().any()) {
+        err = "metal network experts: the experiment requires a native plain-basis Qwen expert pack";
+        return false;
+    }
+    network::Manifest expected;
+    char algorithm[7] = {}, sha[65] = {};
+    FILE* marker = std::fopen((shard1 + ".done").c_str(), "r");
+    const bool have_sha = marker && std::fscanf(marker, "%6s %64s", algorithm, sha) == 2 &&
+                          std::strcmp(algorithm, "sha256") == 0 && std::strlen(sha) == 64;
+    if (marker) std::fclose(marker);
+    if (!have_sha) { err = "metal network experts: missing SHA256 marker " + shard1 + ".done"; return false; }
+    for (const char c : std::string(sha))
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            err = "metal network experts: invalid SHA256 marker " + shard1 + ".done";
+            return false;
+        }
+    expected.model_id = sha;
+    expected.layout.reserve(48);
+    for (int l = 0; l < 48; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
+                           *d = f_.find(b + "ffn_down_exps.weight");
+        const auto& fmt = layout.fmt[(size_t) l];
+        if (!g || !u || !d || g->shape != std::vector<uint64_t>{N, NFF, NEXP} || u->shape != g->shape ||
+            d->shape != std::vector<uint64_t>{NFF, N, NEXP} || g->type != u->type ||
+            !(g->type == 18 || g->type == 21 || g->type == 22 || g->type == 23) ||
+            !(d->type == 20 || d->type == 42) || fmt.gu_type != g->type || fmt.d_type != d->type ||
+            fmt.n_embd != N || fmt.n_ff != NFF || fmt.had_block || fmt.had_gu || fmt.had_d ||
+            fmt.gu_signs || fmt.d_signs || fmt.tail_off) {
+            err = "metal network experts: unsupported native expert basis/layout in layer " + std::to_string(l);
+            return false;
+        }
+        network::Layer layer;
+        layer.gu_type = (uint32_t) g->type;
+        layer.down_type = (uint32_t) d->type;
+        layer.gu_row = ref::row_bytes(g->type, N);
+        layer.down_row = ref::row_bytes(d->type, NFF);
+        layer.blob_bytes = 2 * layer.gu_row * NFF + layer.down_row * N;
+        if (g->bytes != layer.gu_row * NFF * NEXP || u->bytes != g->bytes ||
+            d->bytes != layer.down_row * N * NEXP || fmt.gu_row != layer.gu_row || fmt.d_row != layer.down_row ||
+            fmt.up_off != layer.gu_row * NFF || fmt.down_off != 2 * layer.gu_row * NFF ||
+            fmt.bytes != layer.blob_bytes) {
+            err = "metal network experts: native expert row metadata differs from GGUF in layer " + std::to_string(l);
+            return false;
+        }
+        expected.layout.push_back(layer);
+    }
+    auto client = std::make_unique<strata::core::NetworkExperts>();
+    if (!client->open(endpoint, expected, err)) return false;
+    net_prefix_ = client->manifest().owned;
+    net_results_.resize((size_t) MAXT * TOPK * N);
+    net_io_error_.reserve(4096);
+    net_owned_ = cx_->alloc((size_t) 48 * NEXP * sizeof(uint32_t));
+    for (int l = 0; l < 48; ++l)
+        for (int e = 0; e < NEXP; ++e) net_owned_.as<uint32_t>()[(size_t) l * NEXP + e] = (uint32_t) e < net_prefix_;
+    std::fprintf(stderr, "strata metal network experts: %s owns IDs [0,%u) in all 48 layers (%.2f GiB worker RAM weights); "
+                         "Metal keeps routing/attention/KV and the other %u experts; prompts use <=%d-row windows\n",
+                 endpoint.c_str(), net_prefix_, client->manifest().weight_bytes / (double) (1ull << 30),
+                 NEXP - net_prefix_, MAXT);
+    net_ = std::move(client);
+    return true;
+}
+
+void Window::network_fail(const char* message) noexcept {
+    if (!net_error_[0]) std::snprintf(net_error_, sizeof net_error_, "metal network experts: %s", message);
+    net_pending_ = false;
+    net_->close();
+}
+
+void Window::network_begin(int layer) {
+    net_count_ = 0;
+    net_pending_ = false;
+    const int32_t* plan = plan_.as<int32_t>();
+    for (int g = 0; g < plan[0]; ++g) {
+        const uint32_t expert = (uint32_t) plan[P_GEXP + g];
+        if (expert >= net_prefix_) continue;
+        for (int row = plan[P_GSTART + g]; row < plan[P_GSTART + g + 1]; ++row) {
+            // Defined even on failure: the submitted graph must drain, but its result will never be committed.
+            std::memset(ye_.as<float>() + (size_t) row * N, 0, N * sizeof(float));
+            net_jobs_[net_count_] = {expert, (uint32_t) plan[P_ETOK + row], (uint32_t) row};
+            std::memcpy(&net_weights_[net_count_], plan + P_EW + row, sizeof(float));
+            ++net_count_;
+        }
+    }
+    if (net_error_[0] || net_count_ == 0) return;
+    if (!net_->begin((uint32_t) layer, (uint32_t) seg_T_, XF_.b.as<float>(), net_jobs_.data(), net_count_, net_io_error_)) {
+        network_fail(net_io_error_.c_str());
+        return;
+    }
+    net_pending_ = true;
+}
+
+void Window::network_finish() {
+    if (!net_pending_ || net_error_[0]) return;
+    if (!net_->finish(net_results_.data(), net_count_ * N, net_io_error_)) {
+        network_fail(net_io_error_.c_str());
+        return;
+    }
+    net_pending_ = false;
+    for (size_t j = 0; j < net_count_; ++j) {
+        float* dst = ye_.as<float>() + (size_t) net_jobs_[j].row * N;
+        const float* src = net_results_.data() + j * N;
+        const float weight = net_weights_[j];
+        for (int k = 0; k < N; ++k) dst[k] = weight * src[k];   // worker outputs are unweighted; exactly one weighting
+    }
+}
+
+void Window::at_cut(int s) {
+    const int layer = net_ ? s / 2 : s;
+    if (net_ && (s & 1)) {
+        try { network_finish(); }
+        catch (const std::exception& e) { network_fail(e.what()); }
+        catch (...) { network_fail("unknown finish failure"); }
+        return;
+    }
+    if (net_) {
+        try { network_begin(layer); }
+        catch (const std::exception& e) { network_fail(e.what()); }
+        catch (...) { network_fail("unknown begin failure"); }
+    }
+    // Local fill is required even after a remote error: every already-submitted segment must complete safely.
+    st_->at_layer(layer, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(),
+                  st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) layer * MAXT * NEXP : nullptr,
+                  predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) layer * MAXT * NEXP : nullptr);
+}
+
 bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1,
                   int max_t, int64_t max_cells, std::string& err) {
     ss_ = &ss;
@@ -451,9 +607,12 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     if (!f_.open(shard1, err)) return false;
     cx_ = std::make_unique<mtl::Context>();
     stream_ = ExpertStream::wanted(f_, *cx_);
+    if (const char* endpoint = std::getenv("STRATA_NETWORK_EXPERTS"); endpoint && *endpoint)
+        if (!network_init(endpoint, shard1, err)) return false;
     if (stream_) {
         // the model does not fit: the dense weights are read into memory below, the experts stream from the SSD
         st_ = std::make_unique<ExpertStream>();
+        if (net_) st_->exclude_owned_prefix(net_prefix_);
         if (!st_->open(f_, err)) return false;
     } else {
         {   // read ahead the weights, not the n-gram table: in a Gyro file it is 28.8 GB in the middle of the one file, read by the host from
@@ -745,6 +904,27 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     cur_inj_ = 1 - cur_inj_;
 }
 
+void Window::cvec_write(std::vector<mtl::Dispatch>& ds, int layer, int n, const mtl::Buffer& R,
+                        const mtl::Buffer& bo, const mtl::Buffer& inj) {
+    const auto& cv = strata::kernels::cvec();
+    if (!cvec_dir_.ptr) {
+        const size_t layers = cv.steered.size();
+        cvec_dir_ = cx_->alloc(layers * N * sizeof(float));
+        cvec_scale_ = cx_->alloc(layers * sizeof(float));
+        cvec_on_ = cx_->alloc(sizeof(int));
+        std::memcpy(cvec_dir_.ptr, cv.dir, layers * N * sizeof(float));
+        std::memcpy(cvec_scale_.ptr, cv.s, layers * sizeof(float));
+        strata::kernels::cvec_metal_bind_flag(cvec_on_.as<int>());
+    }
+    struct Args { uint32_t n_embd, hc, layer, mode; } a{N, HC, (uint32_t) layer, (uint32_t) cv.mode};
+    mtl::Dispatch d;
+    d.p = P(lib_, "gr_cvec", {}, "gr_cvec");
+    d.args = {mtl::Arg::B(R), mtl::Arg::B(bo), mtl::Arg::B(inj), mtl::Arg::B(cvec_dir_),
+              mtl::Arg::B(cvec_scale_), mtl::Arg::B(cvec_on_), mtl::Arg::V(a)};
+    d.grid[0] = HC; d.grid[1] = n; d.tg[0] = 256;
+    push(ds, d);
+}
+
 namespace {
 struct HadArgs { uint32_t width, x_stride, y_stride; float scale; uint32_t has_signs, pad; };   // quant.metal
 }
@@ -777,7 +957,8 @@ void Window::had_rows_ind(std::vector<mtl::Dispatch>& ds, int lib, const std::st
 void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0) {
     const std::string b = "blk." + std::to_string(l) + ".";
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
-    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_) && !strata::kernels::cvec().covers(l - 1),
+            XA_, false, ntok);
     if (l % 4 != 3) {
         const int gi = l - l / 4;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -973,7 +1154,8 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const bool ct = metal_ctab();
         mtl::Constants ac = stream_ ? mtl::Constants().b(20, true) : mtl::Constants();
         ac.b(23, ct);
-        const std::string ak = std::string(stream_ ? "#arena" : "") + (ct ? "#ct" : "");
+        if (net_) ac.b(30, true);
+        const std::string ak = std::string(stream_ ? "#arena" : "") + (ct ? "#ct" : "") + (net_ ? "#network" : "");
         g.p = P(lib_, gun, ac, gun + ak);
         const bool hg = had_gu(l), hd = had_dn(l);
         if (hg) had_rows(ds, lib_, "d:", XF_.b, 0, XR_, 0, ntok, N, hsx_.handle ? &hsx_ : nullptr, false);   // before the host's turn
@@ -982,6 +1164,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         if (stream_)
             for (int c = -1; c < 3; ++c)
                 g.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
+        if (net_) g.args.push_back(mtl::Arg::B(net_owned_, (size_t) l * NEXP * sizeof(uint32_t)));
         g.tg[0] = 32 * gs;
         g.indirect = &plan_;
         g.ind_off = P_IGU * 4;
@@ -996,10 +1179,12 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         if (stream_)
             for (int c = -1; c < 3; ++c)
                 dd.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
+        if (net_) dd.args.push_back(mtl::Arg::B(net_owned_, (size_t) l * NEXP * sizeof(uint32_t)));
         dd.tg[0] = 32 * ds_;
         dd.indirect = &plan_;
         dd.ind_off = P_IDN * 4;
         push(ds, dd);
+        if (net_ && cuts_) cuts_->push_back((int) ds.size());   // remote results before combine, after local down
     }
     {
         GlueArgs a{N, (uint32_t) ntok, N, TOPK};
@@ -1010,6 +1195,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         d.tg[0] = 256;
         push(ds, d);
     }
+    if (strata::kernels::cvec().covers(l)) cvec_write(ds, l, ntok, R_, bo_, inj_[cur_inj_]);
 }
 
 namespace {
@@ -1074,10 +1260,34 @@ void Window::ple_cpu(int Tn) {
     }
 }
 
-bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
+bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err,
+                 const char* phase) {
+    if (net_error_[0]) { err = net_error_; return false; }
     mtp_src_ = nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
+    if (net_ && !net_->begin_window(phase, pos0, (uint32_t) Tn, err)) {
+        network_fail(err.c_str());
+        return false;
+    }
+    struct NetworkWindow {
+        strata::core::NetworkExperts* client;
+        std::string& err;
+        ~NetworkWindow() {
+            // This also covers pre-graph failures and exception unwinding. Remote
+            // callback failures reach here only after the submitted graph drains.
+            if (client && !client->end_window(false, err)) client->close();
+        }
+        bool finish(bool success) {
+            auto* current = client;
+            client = nullptr;
+            if (current && !current->end_window(success, err)) {
+                current->close();
+                return false;
+            }
+            return success;
+        }
+    } network_window{net_.get(), err};
     const double t0 = now_ms();
     // ---- the embeddings (CPU dequant of the token rows straight into the shared buffer), broadcast to the streams
     const gguf::Tensor& te = T("token_embd.weight");
@@ -1131,6 +1341,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         seg_T_ = Tn;
         const double r0 = now_ms();
         last_gpu_ms_ = 1000.0 * run_ds(c);
+        if (net_error_[0]) { err = net_error_; return false; }
         {
             static const int kt = std::getenv("STRATA_METAL_KPROF") ? std::atoi(std::getenv("STRATA_METAL_KPROF")) : 0;
             static int seen = 0;
@@ -1138,7 +1349,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
-        return finish(Tn, tokens, pos0, head, out, t0);
+        return network_window.finish(finish(Tn, tokens, pos0, head, out, t0));
     }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     Cached& cw = wcache_[key];
@@ -1193,7 +1404,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     for (int l = 1; l < 48; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    gr_read(ds, "output_hc", !strata::kernels::cvec().covers(47), XA_, true, Tn);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -1215,9 +1426,10 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     seg_T_ = Tn;
     const double r0 = now_ms();
     last_gpu_ms_ = 1000.0 * run_ds(cw);
+    if (net_error_[0]) { err = net_error_; return false; }
     tp_rg_ = now_ms() - r0;
     last_n_disp_ = (int) ds.size();
-    return finish(Tn, tokens, pos0, head, out, t0);
+    return network_window.finish(finish(Tn, tokens, pos0, head, out, t0));
 }
 
 double Window::run_ds(Cached& c) {
@@ -1247,10 +1459,12 @@ void stream_atexit() {
 }
 }  // namespace
 
+void report_expert_stream() { stream_atexit(); }
+
 // The arena, once the rest is allocated (the MTP layer loads after init): what the GPU working set and the RAM leave
 // with STRATA_METAL_KEEP_FREE_GB kept for macOS (default: 7 GB, or 15% of the RAM when that is more - the M5 Max
 // froze with an 89 GB arena and 7 GB left beside a 50 GB n-gram table read through the file cache; arena_budget.h);
-// STRATA_METAL_ARENA_GB sets it.
+// STRATA_METAL_ARENA_GB forces it; STRATA_METAL_ARENA_MAX_GB only caps automatic sizing.
 bool Window::stream_arena(std::string& err) {
     uint64_t phys = 0;
     size_t len = sizeof phys;
@@ -1290,6 +1504,17 @@ bool Window::stream_arena(std::string& err) {
         am.ple_mapped = (double) ss_->ple.table->rows() * 192.0;   // a row is at most 192 bytes (Q8_0 + its scale)
     if (const char* e = std::getenv("STRATA_METAL_KEEP_FREE_GB")) am.keep_gb = std::atof(e);
     if (const char* e = std::getenv("STRATA_METAL_ARENA_GB")) am.arena_gb = std::atof(e);
+    if (const char* e = std::getenv("STRATA_METAL_ARENA_MAX_GB")) {
+        char* end = nullptr;
+        am.arena_max_gb = std::strtod(e, &end);
+        if (end == e || *end || !std::isfinite(am.arena_max_gb) || am.arena_max_gb < 1.0 ||
+            am.arena_max_gb > am.phys / gb || am.arena_gb >= 0) {
+            err = "STRATA_METAL_ARENA_MAX_GB must be between 1 GB and physical RAM, without STRATA_METAL_ARENA_GB";
+            return false;
+        }
+        std::fprintf(stderr, "strata metal stream: automatic arena ceiling %.2f GB; memory shrink/growth checks remain active\n",
+                     am.arena_max_gb);
+    }
     if (const char* e = std::getenv("STRATA_METAL_LEAVE_SHARE")) am.leave_share = std::atof(e);   // for measuring; the default is kLeaveShare
     const double keep = arena_keep(am);
     const double avail = am.available;
@@ -1319,13 +1544,15 @@ bool Window::stream_arena(std::string& err) {
                                                      "resident of 128)" : "");
     }
     const char* epg = std::getenv("STRATA_METAL_PROMPT_GEMM");
-    const bool pg_on = !(epg && std::string(epg) == "0");
+    const bool pg_on = !net_ && !(epg && std::string(epg) == "0");
     bool minimal = false;   // the arena's least layout (the min slots) is not shrunk further: it goes ahead, filled in steps
     for (int tries = 0;; ++tries) {
         const double planned = budget;
         std::function<uint64_t()> recheck = [&]() -> uint64_t { return (uint64_t) arena_shrink(am, planned, avail_now()); };
-        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : 64, err, minimal ? std::function<uint64_t()>() : recheck,
-                            [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); }))
+        if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : (net_ ? MAXT * TOPK : 64), err,
+                            minimal ? std::function<uint64_t()>() : recheck,
+                            [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); },
+                            am.arena_max_gb >= 0 ? (uint64_t) (am.arena_max_gb * gb) : 0))
             break;
         if (st_->shrink_to() == 0 || tries == 4) return false;
         if ((double) st_->shrink_to() + 64.0 * (1 << 20) >= budget) minimal = true;   // no smaller layout than this one
@@ -1427,6 +1654,7 @@ void Window::kprof(const std::vector<mtl::Dispatch>& ds, int Tn) {
 }
 
 Window::~Window() {
+    if (cvec_on_.ptr) strata::kernels::cvec_metal_bind_flag(nullptr);
     if (logpos_) std::fclose(logpos_);
     if (std::getenv("STRATA_METAL_PROFILE") == nullptr) return;
     auto line = [](const char* what, const Prof& x) {
@@ -1500,7 +1728,7 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
 }
 
 bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err) {
-    (void) err;
+    if (net_error_[0]) { err = net_error_; return false; }
     if (pend_fold_ > 0) {   // the last commit's fold first: the checkpoint is the state after it
         std::vector<mtl::Dispatch> ds;
         nb_ = false;
@@ -1546,6 +1774,7 @@ void Window::reset() {
 }
 
 bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
+    if (net_error_[0]) { err = net_error_; return false; }
     const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 4 * 128, dsz = 4 * 128;
     if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) 4 * 9 * 10240 ||
         c.tails.size() != tail_.size() * ts || c.dead.size() != dead_.size() * dsz) {
@@ -1567,6 +1796,7 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, s
 }
 
 bool Window::commit(int n_keep, std::string& err) {
+    if (net_error_[0]) { err = net_error_; return false; }
     if (n_keep < 1 || n_keep > last_T_) { err = "metal window: commit count out of range"; return false; }
     using namespace strata::kernels;
     if (last_T_ > 1) {
@@ -2088,6 +2318,7 @@ bool Window::mtp_draft(int Tn, const int32_t* tokens, int64_t p, int a, int max_
 }
 
 bool Window::copy_logits(int t, float* host) const {
+    if (net_error_[0]) return false;
     if (t < 0 || t >= last_T_) return false;
     std::memcpy(host, lm_.as<float>() + (size_t) t * n_vocab_, (size_t) n_vocab_ * 4);
     return true;
@@ -2133,6 +2364,7 @@ struct Window::PromptGemm {
 int Window::prompt_chunk_rows() const { return pg_ ? pg_->MT : 0; }
 
 bool Window::prompt_gemm_on(int64_t n) const {
+    if (net_) return false;
     static const bool on = [] {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         return e ? std::string(e) != "0" : true;
@@ -2145,6 +2377,7 @@ bool Window::prompt_gemm_on(int64_t n) const {
 }
 
 bool Window::prompt_gemm_init(std::string& err) {
+    if (net_) { err = "metal network experts: prompt GEMM is disabled; use the MAXT window path"; return false; }
     if (pg_) return true;
     if (stream_ && !st_->ready()) return stream_arena(err);   // it makes the prompt buffers after the arena
     const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
@@ -2236,6 +2469,7 @@ bool Window::prompt_gemm_init(std::string& err) {
 }
 
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
+    if (net_) { err = "metal network experts: prompt chunks cannot bypass remote ownership"; return false; }
     PromptGemm& p = *pg_;
     p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
     p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
@@ -2340,7 +2574,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     (void) MB;
     for (int l = 0; l < 48; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
-        hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_) && !strata::kernels::cvec().covers(l - 1));
         if (l % 4 != 3) {
             const int gi = l - l / 4;
             dq(TN(b + "attn_qkv.weight"), p.Wqkv);
@@ -2516,10 +2750,12 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const uint32_t oa[2] = {(uint32_t) T, N};
         D(PP(p.lib, "moe_out"), {mtl::Arg::B(p.yr), mtl::Arg::B(p.ys), mtl::Arg::B(p.sgv), mtl::Arg::B(p.bo), mtl::Arg::V(oa)},
           (T * N + 255) / 256, 1, 256);
+        const bool cvec_applied = strata::kernels::cvec().covers(l);
+        if (cvec_applied) cvec_write(ds, l, T, p.R, p.bo, p.inj[ci]);
         if (l == 0 && ple_on_) {
             // layer 0's FFN write applied to R, then the PLE block (as the window, for T rows)
             const gguf::Tensor& tn = TN("blk.1.hc_attn_norm.weight");
-            GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
+            GrArgs a{N, HC, LR, (uint32_t) T, cvec_applied ? 0u : 1u, eps_};
             D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                                   mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
             struct PleArgs { uint32_t n_embd, hc; float eps; } pl{N, HC, strata::kernels::NG_RMS_EPS};
@@ -2540,7 +2776,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     // the last layer's write applied to R (the draft layer's K/V read the final residual rows)
     {
         const gguf::Tensor& tn = TN("output_hc_norm.weight");
-        GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
+        GrArgs a{N, HC, LR, (uint32_t) T, strata::kernels::cvec().covers(47) ? 0u : 1u, eps_};
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
     }
@@ -2626,7 +2862,7 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
     // STRATA_LOGPOS (the quant yardstick, the KL harness): every window's head logits are read, also the prompt's
     // windows that sample nothing (head_sampling off)
     static const bool logpos = std::getenv("STRATA_LOGPOS") != nullptr;
-    return ((Window*) w)->run(T, tokens, pos0, head || logpos, out, err);
+    return ((Window*) w)->run(T, tokens, pos0, head || logpos, out, err, head ? "decode" : "prefill");
 }
 void window_reset() {
     if (g_the_window != nullptr && g_the_window->ready()) g_the_window->reset();
@@ -2691,8 +2927,9 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
-    if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
-    if (!windows && g_window->streaming()) {
+    if (!windows && !g_window->networked() && !g_window->streaming() && n >= min_rows)
+        return g_window->prompt(tokens, n, pos0, on_chunk, err);
+    if (!windows && !g_window->networked() && g_window->streaming()) {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         const int64_t mn = em ? std::atoll(em) : 64;
@@ -2715,7 +2952,7 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
     for (int64_t c = 0; c < n; c += MAXT) {
         const int k = (int) std::min<int64_t>(MAXT, n - c);
         for (int i = 0; i < k; ++i) tk[i] = (int32_t) tokens[c + i];
-        if (!g_window->run(k, tk, pos0 + c, false, out, err) || !g_window->commit(k, err)) return false;
+        if (!g_window->run(k, tk, pos0 + c, false, out, err, "prefill") || !g_window->commit(k, err)) return false;
         if (on_chunk && !on_chunk(nullptr, k, pos0 + c, err)) return false;
     }
     return true;

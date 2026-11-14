@@ -37,6 +37,8 @@ public:
     // On when STRATA_METAL_STREAM=1, or (unset / auto) when the GGUF's experts do not fit in the GPU working set
     // with room to spare.  =0: never (the whole GGUF wrapped, as on the M5 Max).
     static bool wanted(const gguf::File& f, const mtl::Context& cx);
+    // Static remote ownership: exclude these expert IDs in every layer before opening/filling the arena.
+    void exclude_owned_prefix(uint32_t count) { owned_prefix_ = count; }
     bool open(const gguf::File& f, std::string& err);
     // pread `len` bytes at file offset `off` (F_NOCACHE)
     bool read(void* dst, uint64_t len, uint64_t off) const;
@@ -48,9 +50,10 @@ public:
     // min_slots: each size class at least this many slots (576 with prompt chunks, else 64)
     // recheck (optional): just before the arena is committed, the bytes it may have now (arena_shrink); when that is
     // less than the arena laid out, nothing is allocated, shrink_to() says how much, and the caller tries again
+    // max_bytes (optional): reject even the minimum layout if it exceeds this hard ceiling; 0 means unset.
     bool make_arena(mtl::Context& cx, uint64_t budget, const std::string& profile, int min_slots, std::string& err,
                     const std::function<uint64_t()>& recheck = {},
-                    const std::function<bool(uint64_t)>& grow = {});
+                    const std::function<bool(uint64_t)>& grow = {}, uint64_t max_bytes = 0);
     uint64_t shrink_to() const { return shrink_to_; }
     uint64_t arena_used_bytes() const { return arena_live_; }   // the arena's bytes in use (its retired slots left out)
     bool ready() const { return !chunks_.empty(); }
@@ -92,6 +95,7 @@ private:
     uint8_t* standalone_region(uint64_t bytes);   // the prompt's buffers as their own allocation, when no region of the arena's slots takes them
 
     int fd_ = -1;
+    uint32_t owned_prefix_ = 0;
     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
     int cfd_ = -1;

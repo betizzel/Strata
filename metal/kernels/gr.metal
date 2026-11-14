@@ -51,6 +51,41 @@ kernel void gr_norm(device float* R [[buffer(0)]], device const float* bo [[buff
     for (uint d = tid; d < n; d += 256) o[d] = r[d] * w[d] * rs;
 }
 
+// Apply the pending FFN write, then the per-layer control vector to each
+// residual stream. The request flag is shared with the host between requests.
+struct CvecArgs { uint n_embd, hc, layer, mode; };
+kernel void gr_cvec(device float* R [[buffer(0)]], device const float* bo [[buffer(1)]],
+                    device const float* inj [[buffer(2)]], device const float* dir [[buffer(3)]],
+                    device const float* scale [[buffer(4)]], device const int* enabled [[buffer(5)]],
+                    constant CvecArgs& a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
+                    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+                    ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    const uint c = tg.x, t = tg.y, n = a.n_embd;
+    device float* r = R + (t * a.hc + c) * n;
+    device const float* v = dir + a.layer * n;
+    const float g = 2.0f / (1.0f + exp(-inj[t * a.hc + c] / float(a.hc)));
+    const bool on = *enabled != 0;
+    float dot = 0.0f;
+    for (uint d = tid; d < n; d += 256) {
+        const float h = fma(bo[t * n + d], g, r[d]);
+        r[d] = h;
+        if (on && a.mode == 0) dot = fma(h, v[d], dot);
+    }
+    if (!on) return;
+    if (a.mode == 0) {
+        dot = simd_sum(dot);
+        if (lane == 0) part[sg] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        for (int i = 0; i < 8; ++i) total += part[i];
+        const float s = scale[a.layer] * total;
+        for (uint d = tid; d < n; d += 256) r[d] -= s * v[d];
+    } else {
+        for (uint d = tid; d < n; d += 256) r[d] += v[d];
+    }
+}
+
 // rows: 0 .. hc_lr - 1 = w_down, hc_lr .. hc_lr + hc - 1 = w_inject (both bf16 rows of hc * n_embd).
 // SG simdgroups split the row's units KS ways; LPR = 32 (a simdgroup per row); RS = SG / KS rows per threadgroup.
 // one row's K-split partial over xn (units of format F)

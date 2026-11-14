@@ -38,6 +38,18 @@ int main() {
     o.arena_gb = 10.0;
     check(std::fabs(arena_budget(o) - 10.0 * kGB) < 1e6, "STRATA_METAL_ARENA_GB=10 wins", arena_budget(o));
     check(std::fabs(arena_shrink(o, 10.0 * kGB, 1.0 * kGB) - 10.0 * kGB) < 1e6, "an explicit arena is not shrunk", 10.0 * kGB);
+    // A ceiling must not become the forced-size override or bypass changing memory availability.
+    ArenaMem capped = m4;
+    capped.arena_max_gb = 8.0;
+    check(std::fabs(arena_budget(capped) - 8.0 * kGB) < 1e6, "automatic arena obeys the 8 GB ceiling", arena_budget(capped));
+    check(std::fabs(arena_shrink(capped, 8.0 * kGB, 12.0 * kGB) - 4.5 * kGB) < 1e6,
+          "capped arena still shrinks when available RAM drops", arena_shrink(capped, 8.0 * kGB, 12.0 * kGB));
+    check(std::fabs(arena_shrink(capped, 8.0 * kGB, 30.0 * kGB) - 8.0 * kGB) < 1e6,
+          "more free RAM cannot grow a capped arena", arena_shrink(capped, 8.0 * kGB, 30.0 * kGB));
+    check(!arena_grow(capped, 8.0 * kGB, 1.5 * kGB), "capped arena stops filling at the memory reserve", 8.0 * kGB);
+    capped.arena_max_gb = 20.0;
+    check(std::fabs(arena_budget(capped) - arena_budget(m4)) < 1e6,
+          "a generous ceiling does not increase automatic allocation", arena_budget(capped));
     // never below 1 GB; the GPU working set bounds it too
     ArenaMem tiny{16 * kGB, 10 * kGB, 9.5 * kGB, 8 * kGB};
     check(std::fabs(arena_budget(tiny) - 1.0 * kGB) < 1e6, "a 16 GB Mac with nothing left: 1 GB (low hit rate)", arena_budget(tiny));

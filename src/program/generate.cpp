@@ -129,7 +129,10 @@
 
 #include <cuda_runtime.h>
 #if defined(STRATA_GPU_METAL)
-namespace strata::metal_engine { void set_model_shard(const char* shard1); }   // metal/src/engine/window.cpp
+namespace strata::metal_engine {   // metal/src/engine/window.cpp
+void set_model_shard(const char* shard1);
+void report_expert_stream();
+}
 #endif
 
 #include <array>
@@ -17405,6 +17408,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
+        // _Exit skips atexit and destructors: preserve the cache/I/O evidence before leaving.
+        strata::metal_engine::report_expert_stream();
         std::fflush(stdout);
         std::fflush(stderr);
         std::_Exit(0);

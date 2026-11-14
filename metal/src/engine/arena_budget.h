@@ -44,6 +44,7 @@ struct ArenaMem {
     double keep_gb = -1;      // STRATA_METAL_KEEP_FREE_GB (< 0: unset)
     double arena_gb = -1;     // STRATA_METAL_ARENA_GB (< 0: unset)
     double leave_share = -1;  // STRATA_METAL_LEAVE_SHARE: the share of the RAM a big Mac leaves to macOS (< 0: kLeaveShare)
+    double arena_max_gb = -1; // optional ceiling on automatic sizing; shrink/growth checks remain active
 };
 
 constexpr double kGB = 1e9;
@@ -114,7 +115,8 @@ inline double arena_budget(const ArenaMem& m) {
     const double gpu = m.working_set - footprint_base(m) - 1.0 * kGB;
     const double ram = m.available - arena_keep(m) - arena_ple_reserve(m);
     const double foot = footprint_cap(m) - footprint_base(m) - arena_ple_reserve(m);   // the whole footprint under the cap
-    return std::max(1.0 * kGB, std::min(std::min(gpu, ram), foot));
+    const double budget = std::max(1.0 * kGB, std::min(std::min(gpu, ram), foot));
+    return m.arena_max_gb >= 0 ? std::min(budget, m.arena_max_gb * kGB) : budget;
 }
 
 /// The plan as numbers, for the log line and the tests: what the engine will hold with `arena` bytes of arena.

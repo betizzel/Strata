@@ -29,13 +29,58 @@ void missing(const char* name) {
 
 }  // namespace strata::metal_engine
 
-// ---- entry points the shared host loop asks every request, with nothing to do on Metal yet
 #include "strata/kernels/cvec.hpp"
 namespace strata::kernels {
-// no control vector on Metal (--control-vector-scaled is not ported): the empty one, `loaded()` false
-const Cvec& cvec() {
-    static const Cvec none{};
-    return none;
+namespace {
+Cvec g_cvec;
+std::vector<float> g_cvec_dir, g_cvec_s;
+int g_cvec_on = 1;
+int* g_cvec_metal_flag = nullptr;
+}
+
+const Cvec& cvec() { return g_cvec; }
+
+bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
+                 int64_t n_embd, int64_t hc, std::string& err) {
+    if (n_embd < 1 || n_embd > 4096) { err = "control vector: unsupported n_embd"; return false; }
+    if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
+    g_cvec_dir = dir;
+    g_cvec_s = s;
+    g_cvec_on = 1;
+    if (g_cvec_metal_flag) *g_cvec_metal_flag = g_cvec_on;
+    g_cvec.dir = g_cvec_dir.data();
+    g_cvec.s = g_cvec_s.data();
+    g_cvec.on = &g_cvec_on;
+    g_cvec.mode = mode;
+    g_cvec.first = first;
+    g_cvec.last = last;
+    g_cvec.n_embd = n_embd;
+    g_cvec.hc = hc;
+    g_cvec.steered.assign(s.size(), false);
+    for (size_t l = 0; l < s.size(); ++l) g_cvec.steered[l] = s[l] != 0.0f;
+    return true;
+}
+
+bool cvec_replicate(std::string&) { return true; }
+
+void cvec_set_enabled(bool on) {
+    if (g_cvec.loaded()) {
+        g_cvec_on = on ? 1 : 0;
+        if (g_cvec_metal_flag) *g_cvec_metal_flag = g_cvec_on;
+    }
+}
+
+void cvec_metal_bind_flag(int* ptr) {
+    g_cvec_metal_flag = ptr;
+    if (ptr) *ptr = g_cvec_on;
+}
+
+bool cvec_enabled() { return g_cvec.loaded() && g_cvec_on != 0; }
+
+bool cvec_tables(const float** dir, const float** s, const int** on) {
+    if (!g_cvec.loaded()) return false;
+    *dir = g_cvec.dir; *s = g_cvec.s; *on = g_cvec.on;
+    return true;
 }
 }  // namespace strata::kernels
 

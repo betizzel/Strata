@@ -19,6 +19,7 @@
 #include "mtl_rt.h"
 #include "ref_quant.h"
 #include "gguf_lite.h"
+#include "strata/core/network_experts.hpp"
 // Gyro: the engine's CPU Hadamard rotation (the reference of the Metal one) and hadamard.txt's parser
 #include "../../src/kernels/cpu/hadamard.cpp"
 
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -139,6 +141,7 @@ bool g_had_h = false;
 bool g_dn_prep = false;   // Q2_0 down: prepared h (an xprep dispatch) instead of the raw-x decoder
 const mtl::Buffer* g_xpx = nullptr;
 const mtl::Buffer* g_xph = nullptr;
+const mtl::Buffer* g_network_mask = nullptr;
 
 void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::Buffer& W, size_t w_off,
                   const mtl::Buffer& x, const mtl::Buffer& h, const mtl::Buffer& ye, const mtl::Buffer& y,
@@ -158,6 +161,10 @@ void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::B
         d.p = &K.gu;
         d.args = {mtl::Arg::B(W, w_off), mtl::Arg::B(XPX, 4 * PLANE_X * xkind(g_gu_type)), mtl::Arg::B(h),
                   mtl::Arg::B(plan, plan_off), mtl::Arg::V(a), mtl::Arg::B(XPX, 4 * PLANE_X * 4)};
+        if (g_network_mask) {
+            for (int i = 0; i < 4; ++i) d.args.push_back(mtl::Arg::B(W, w_off));
+            d.args.push_back(mtl::Arg::B(*g_network_mask));
+        }
         d.tg[0] = K.cgu.S * 32;
         d.indirect = &plan;
         d.ind_off = plan_off + P_IGU * 4;
@@ -182,6 +189,10 @@ void encode_layer(std::vector<mtl::Dispatch>& ds, const Kernels& K, const mtl::B
         d.args = {mtl::Arg::B(W, w_off),
                   dk ? mtl::Arg::B(XPH, 4 * PLANE_H * dk) : mtl::Arg::B(h), mtl::Arg::B(ye),
                   mtl::Arg::B(plan, plan_off), mtl::Arg::V(a), mtl::Arg::B(XPH, 4 * PLANE_H * 4)};
+        if (g_network_mask) {
+            for (int i = 0; i < 4; ++i) d.args.push_back(mtl::Arg::B(W, w_off));
+            d.args.push_back(mtl::Arg::B(*g_network_mask));
+        }
         d.tg[0] = K.cdn.S * 32;
         d.indirect = &plan;
         d.ind_off = plan_off + P_IDN * 4;
@@ -222,6 +233,7 @@ int main(int argc, char** argv) {
     bool bench = false, sweep = false, had_test = false, decode_check = false;
     double share = 0.0;
     std::string gguf_path, had_pack;
+    std::string network_endpoint;
     int real_layer = 0, experts_first = 0;
     uint64_t seed = 1;
     bool cfg_gu_set = false, cfg_dn_set = false;
@@ -245,6 +257,7 @@ int main(int argc, char** argv) {
         else if (a == "--had-pack") had_pack = nx();
         else if (a == "--had-test") had_test = true;
         else if (a == "--decode-check") decode_check = true;
+        else if (a == "--network-endpoint") network_endpoint = nx();
         else if (a == "--seed") seed = std::strtoull(nx(), nullptr, 10);
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -263,6 +276,29 @@ int main(int argc, char** argv) {
         if (!tg_ || !tu_ || !td_) { std::fprintf(stderr, "no routed experts in layer %d of %s\n", real_layer, gguf_path.c_str()); return 2; }
         gu = tg_->type;
         dn = td_->type;
+    }
+    strata::core::NetworkExperts remote;
+    if (!network_endpoint.empty()) {
+        if (!tg_ || bench || had_test || !had_pack.empty() || ntok < 1 || ntok > 8) {
+            std::fprintf(stderr, "--network-endpoint requires real plain-basis --gguf parity and --ntok 1..8\n");
+            return 2;
+        }
+        strata::core::network::Manifest expected;
+        std::ifstream identity(gguf_path + ".done");
+        std::string algorithm, err;
+        identity >> algorithm >> expected.model_id;
+        if (algorithm != "sha256") { std::fprintf(stderr, "missing source sha256 marker\n"); return 2; }
+        for (int l = 0; l < 48; ++l) {
+            const std::string prefix = "blk." + std::to_string(l) + ".ffn_";
+            const auto* gate = gf.find(prefix + "gate_exps.weight");
+            const auto* down = gf.find(prefix + "down_exps.weight");
+            if (!gate || !down) { std::fprintf(stderr, "missing layer %d experts\n", l); return 2; }
+            const size_t gr = ref::row_bytes(gate->type, N_EMBD), dr = ref::row_bytes(down->type, N_FF);
+            expected.layout.push_back({(uint32_t) gate->type, (uint32_t) down->type, gr, dr,
+                                       2 * gr * N_FF + dr * N_EMBD});
+        }
+        if (!remote.open(network_endpoint, expected, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
+        experts_first = (int) remote.manifest().owned;
     }
     mtl::Context cx;
     const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal"});
@@ -557,7 +593,63 @@ int main(int argc, char** argv) {
             }
         }
         for (int i = 0; i < ntok * N_EMBD; ++i) ey.add(y.as<float>()[i], yref[i]);
-        const bool ok = plan_ok && eh.rel_l2() < 1e-5 && ey.rel_l2() < 1e-5 && eh.rel_max() < 1e-4 && ey.rel_max() < 1e-4;
+        bool network_ok = true;
+        if (remote.active()) {
+            std::vector<strata::core::network::Job> jobs;
+            jobs.reserve((size_t) ntok * TOPK);
+            for (int i = 0; i < ntok * TOPK; ++i)
+                jobs.push_back({(uint32_t) pick[(size_t) ids[i]], (uint32_t) (i / TOPK), (uint32_t) P[P_TOKENT + i]});
+            std::vector<float> results(jobs.size() * N_EMBD);
+            std::string err;
+            if (!remote.begin((uint32_t) real_layer, (uint32_t) ntok, x.as<float>(), jobs.data(), jobs.size(), err) ||
+                !remote.finish(results.data(), results.size(), err)) {
+                std::fprintf(stderr, "network parity: %s\n", err.c_str()); return 1;
+            }
+            Err entries, mixed;
+            for (size_t j = 0; j < jobs.size(); ++j)
+                for (int d = 0; d < N_EMBD; ++d)
+                    entries.add(w[j] * results[j * N_EMBD + d], ye.as<float>()[jobs[j].row * N_EMBD + d]);
+            const std::vector<float> baseline(y.as<float>(), y.as<float>() + ntok * N_EMBD);
+            mtl::Buffer mask = cx.alloc(512 * sizeof(uint32_t));
+            std::memset(mask.ptr, 0, 512 * sizeof(uint32_t));
+            for (int e = 0; e < NE / 2; ++e) mask.as<uint32_t>()[e] = 1;
+            Kernels split = K;
+            split.gu = cx.pipeline(lib, kname("moe_gu", gu, cgu),
+                                    mtl::Constants().b(23, std::getenv("QUANT_CTAB") != nullptr).b(30, true));
+            split.dn = cx.pipeline(lib, kname("moe_down", dn == ref::Q2_0 && !g_dn_prep ? 142 : dn, cdn),
+                                    mtl::Constants().b(30, true));
+            std::fill(h.as<float>(), h.as<float>() + CAPE * N_FF, std::nanf(""));
+            std::fill(ye.as<float>(), ye.as<float>() + CAPE * N_EMBD, std::nanf(""));
+            g_network_mask = &mask;
+            std::vector<mtl::Dispatch> local;
+            encode_layer(local, split, W, 0, x, h, ye, y, bid, bw, plan, 0, a, false, true, true, false);
+            cx.run(local);
+            for (size_t j = 0; j < jobs.size(); ++j) {
+                const auto& job = jobs[j];
+                if (mask.as<uint32_t>()[ids[j]]) {
+                    for (int d = 0; d < N_FF; ++d)
+                        network_ok = network_ok && std::isnan(h.as<float>()[job.row * N_FF + d]);
+                    for (int d = 0; d < N_EMBD; ++d) {
+                        float& value = ye.as<float>()[job.row * N_EMBD + d];
+                        network_ok = network_ok && std::isnan(value);
+                        value = w[j] * results[j * N_EMBD + d];
+                    }
+                }
+            }
+            g_network_mask = nullptr;
+            std::vector<mtl::Dispatch> combine;
+            encode_layer(combine, K, W, 0, x, h, ye, y, bid, bw, plan, 0, a, false, false, false, true);
+            cx.run(combine);
+            for (int i = 0; i < ntok * N_EMBD; ++i) mixed.add(y.as<float>()[i], baseline[i]);
+            network_ok = network_ok && entries.rel_l2() < 3e-2 && entries.rel_max() < 6e-2 &&
+                         mixed.rel_l2() < 3e-2 && mixed.rel_max() < 6e-2;
+            std::printf("network layer %d ntok %d: weighted CUDA/Metal rows L2 %.3e max %.3e; mixed merge L2 %.3e max %.3e; skipped local rows %s  %s\n",
+                        real_layer, ntok, entries.rel_l2(), entries.rel_max(), mixed.rel_l2(), mixed.rel_max(),
+                        network_ok ? "ok" : "check failed", network_ok ? "PASS" : "FAIL");
+            remote.report(stdout);
+            cx.free(mask);
+        }
+        const bool ok = network_ok && plan_ok && eh.rel_l2() < 1e-5 && ey.rel_l2() < 1e-5 && eh.rel_max() < 1e-4 && ey.rel_max() < 1e-4;
         std::printf("parity %s/%s ntok %d gu %d,%d,%d dn %d,%d,%d: plan %s (%d groups), h rel L2 %.2e max %.2e, "
                     "y rel L2 %.2e max %.2e  %s\n",
                     ref::type_name(gu), ref::type_name(dn), ntok, cgu.L, cgu.R, cgu.S, cdn.L, cdn.R, cdn.S,
