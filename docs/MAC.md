@@ -64,8 +64,9 @@ The engine streams the experts from the SSD. It decides this itself when the exp
   of the RAM when that is more), whichever is smaller. It counts as free only what macOS can give without swapping, fills the
   arena in 1.5 GB steps and stops early rather than push macOS below its reserve.
 - On a Mac with 64 GB or more, the arena, the Metal buffers and the host memory together stay under 60% of the RAM, and the
-  filled arena is wired (`mlock`) so macOS does not compress it while the GPU is idle. `STRATA_METAL_WIRE_ARENA=0` turns the
-  wiring off. `STRATA_METAL_ARENA_GB` sets the arena yourself, with a warning when it is over the cap. The engine prints the
+  arena is wired (`mlock`) step by step as it is filled, so macOS does not compress it during the fill or while the GPU is idle.
+  `STRATA_METAL_WIRE_ARENA=0` turns the wiring off; `=1` turns it on for a smaller Mac (the 48 GB M5 Pro serves with it).
+  `STRATA_METAL_ARENA_GB` sets the arena yourself, with a warning when it is over the cap. The engine prints the
   planned footprint (`planned resident footprint ... cap ...`) and the footprint after the fill.
 - Setup writes a second copy of the experts (`<model>.experts`, 40 GB for IQ3_XXS) in which each expert's three matrices sit
   together, so the SSD reads an expert with one request. On the 32 GB M4 that is about 17% faster decoding and 30% faster prompts
@@ -166,19 +167,28 @@ Where a 4-token decode window went at the start (6 GB arena, 140 ms): about 51 m
 | Purge fix (code): the host code's 6.2 GB of CUDA-shaped weight copies are really released | Footprint before the arena 13.3 → 7.1 GB, resident 11.1 → 8.1 GB. `setPurgeableState(Empty)` had freed nothing: a buffer that has been in the residency set keeps its pages until `release()` |
 | Arena size with the above (decode tok/s / cache hits) | 8.4 GB 24.1 / 0.67; 10.5 GB 26.3 / 0.73; 12.5 GB 28.3 / 0.77; 14 GB 29.3-29.5 / 0.81; 15 GB 30.3-30.6 / 0.82 |
 | 4096-token prompt chunks instead of 2048 (14 GB arena, both runs) | prompts 51.1 → 44.4 s, the 10K-token agent prompt 24.8 → 21.5 s, decode unchanged |
+| `STRATA_METAL_WIRE_ARENA=1`, now wired step by step during the fill (code) | No compression of the fresh arena: first request 3.2-3.5 s instead of up to 14.3 s; 17.5 GB arenas at normal pressure (32.8 tok/s, hits 0.86) |
 
-A 17.5 GB ceiling filled 17.5 GB and macOS compressed the new arena during the fill (warning pressure, stopped); 15 GB stayed
-at normal pressure. Not adopted: a file-cache tier for misses (+10% decode, prompts 10-20% slower, compressed other programs),
-queuing read-ahead before misses, reserving I/O threads, 8 I/O threads, read-ahead top 8 (within noise),
-`STRATA_SPEC_COST=1` (it chose 1-token windows: 20 tok/s instead of 28), `--suffix-draft 3` with MTP (28.4 vs 29.5, slower agent
-turns), cache replacement policies other than LRU (simulated on routing traces: capacity matters, policy does not), and kernel
-work (the 4-token window's 1,230 dispatches are a flat profile: the largest class is 7.6%).
+Unwired, the fresh arena was compressible anonymous memory: in one 15 GB start with 19 GB free, macOS compressed 13.5 GB of
+the just-filled (incompressible) experts within 3 s, and the first request waited 10 s while the GPU wired them back; a 17.5 GB
+fill reached warning pressure. Wiring each fill step as it lands (`mlock`, only filled slots) moves that demand to the file
+cache and to other programs' compressible pages. Wired, a 17.5 GB arena stayed at normal pressure with no swap growth; 19 GB
+(5.5 GB left of 24.5 GB available) reached warning pressure and was stopped. Not adopted: a file-cache tier for misses (+10%
+decode, prompts 10-20% slower, compressed other programs), queuing read-ahead before misses, reserving I/O threads, 8 I/O
+threads, read-ahead top 8 (within noise), `STRATA_SPEC_COST=1` (it chose 1-token windows: 20 tok/s instead of 28), `--spec 3`
+(same as 4) and `--spec 5` (27.7), `--suffix-draft 3` with MTP (28.4 vs 29.5, slower agent turns), cache replacement policies
+other than LRU (simulated on routing traces: capacity matters, policy does not), and kernel work (the 4-token window's 1,230
+dispatches are a flat profile: the largest class is 7.6%). Changing the verify window (spec 3/5, the cost policy, lookups)
+also changes the batched verification's arithmetic: their greedy text differed on the long agent prompt; every arm with the
+`--spec 4` window matched the baseline token for token.
 
 The served setup since 2026-11-13: `STRATA_METAL_DIRECT=1 STRATA_METAL_KEEP_WARM=1 STRATA_METAL_REGION_FIT=1
-STRATA_METAL_PROMPT_SMALL=256 STRATA_METAL_PROMPT_CHUNK=4096 STRATA_METAL_ARENA_MAX_GB=15 STRATA_METAL_KEEP_FREE_GB=7
-STRATA_METAL_ARENA_CHUNK_GB=14`, from its own source snapshot (`~/Developer/Strata-iq3s-prod-src`). The arena is sized at
-each load from the memory free then, so a busier Mac gets a smaller one. Runner, plans, raw results and tools:
-`~/Developer/ai-switch/results-iq3s-speed-20261113/`.
+STRATA_METAL_PROMPT_SMALL=256 STRATA_METAL_PROMPT_CHUNK=4096 STRATA_METAL_ARENA_MAX_GB=17.5 STRATA_METAL_KEEP_FREE_GB=8
+STRATA_METAL_WIRE_ARENA=1 STRATA_METAL_ARENA_CHUNK_GB=14`, from its own source snapshot (`~/Developer/Strata-iq3s-prod-src`,
+commit `9bfd2aac`). The arena is sized at each load from the memory free then (16.1 GB in the final check, 14.5 GB in the live
+service with the image encoder beside it), so a busier Mac gets a smaller one. With that build and settings the suite decoded
+31.4 tok/s (from 20.05) with 44.5 s of prompts (from 55.5 s), identical tokens. Runner, plans, raw results and tools:
+`~/Developer/ai-switch/results-iq3s-speed-20261113/` (`RESULTS.md`).
 
 
 ## Experimental network expert worker (local source build)
@@ -606,9 +616,9 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: force the arena's size (bypasses shrink/growth safeguards), or set the memory left to macOS |
 | `STRATA_METAL_ARENA_MAX_GB=N` | Streaming: cap automatic sizing in decimal GB while retaining memory safeguards; minimum 1 GB, cannot combine with `STRATA_METAL_ARENA_GB`; an oversized minimum slot layout fails before allocation |
 | `STRATA_METAL_LEAVE_SHARE=0.4` | Streaming, 64 GB or more: the share of the RAM left to macOS when the footprint cap is set |
-| `STRATA_METAL_WIRE_ARENA=0` | Streaming, 64 GB or more: leave the filled arena pageable (default: wired) |
+| `STRATA_METAL_WIRE_ARENA=0` / `=1` | Streaming: leave the arena pageable / wire it as it is filled (default: wired on 64 GB or more) |
 | `STRATA_METAL_IGNORE_REPACK=1` | Start although a model repack or setup's preparation is running (the engine refuses by default) |
-| `STRATA_METAL_KEEP_HOST_WEIGHTS=1` | Streaming: keep the host code's own copies of the weights (2 to 3 GB) |
+| `STRATA_METAL_KEEP_HOST_WEIGHTS=1` | Streaming: keep the host code's own device copies of the weights (6.2 GB for IQ3_S: the pack pool, the native head and projections); by default they are released before the arena is sized |
 | `STRATA_METAL_DIRECT=1` | Streaming from the experts' copy: read each expert as whole pages into a per-thread buffer, so nothing lands in macOS's file cache (unaligned `F_NOCACHE` reads kept about 35% of the bytes cached, which pushed the arena itself into the compressor) |
 | `STRATA_METAL_KEEP_WARM=1` | Streaming: while a decode window waits for the SSD, a second queue runs tiny GPU ticks so the GPU stays clocked up between segments (`STRATA_METAL_WARM_TG`, `STRATA_METAL_WARM_ITERS` size a tick) |
 | `STRATA_METAL_REGION_FIT=1` | Streaming: lay the biggest slot class out last, so a prompt's buffers fit in a region of the arena instead of their own allocation |
