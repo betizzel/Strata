@@ -145,6 +145,41 @@ MTP-off long-input/short-output requests. The benchmark kept one conversation ch
 it did not validate production's multi-conversation cache policy, stochastic sampling, thinking, tools or vision.
 No production binary/profile was replaced. The 43008 MiB GPU limit is unchanged; all managed models were left unloaded.
 
+### Streaming speed work (same Mac, 2026-11-13)
+
+The same IQ3_S target, refusal projection, all ten routed experts, native MTP `--spec 4` with the Q2_0 draft, and 65,536 context.
+Each arm ran a fresh engine on one guarded suite: code, prose, an algorithm, an explanation, a four-turn agent conversation
+(a ~10K-token first prompt, then short tool-result turns) and one request with the production sampling (seeded).
+The expert file was evicted from the file cache before every arm. Greedy and seeded-sampled outputs were identical across
+all compared arms (`tools/parity.py`; kernel-profiling arms excluded). These are sequential end-to-end measurements on a
+desktop in use, not a long-context or vision benchmark.
+
+Where a 4-token decode window went at the start (6 GB arena, 140 ms): about 51 ms waiting for the SSD (near its ~12-14 GB/s for
+2 MB random reads), and GPU segments running slower than their 43 ms of pure compute because the GPU clocks down while it waits.
+
+| Change | Effect (decode tok/s; prompt s for the whole suite) |
+| --- | --- |
+| Starting point: production settings with 2048-token chunks, 6 GB arena | 20.05; 55.5 s |
+| `STRATA_METAL_KEEP_WARM=1`: tiny GPU ticks on a second queue while a decode window waits | GPU segment time 73 → 62 ms a window; 21.2 → 23.6 in an A/B |
+| `STRATA_METAL_REGION_FIT=1` + `STRATA_METAL_PROMPT_SMALL=256`: prompt buffers inside the arena; short tool-result prompts leave the arena alone | 23.88 at 8.4 GB (the arena no longer gives up 2.4 GB of separate prompt buffers) |
+| `STRATA_METAL_DIRECT=1`: page-aligned bounce reads | Unaligned `F_NOCACHE` reads left about 35% of the bytes in the file cache; the cache then grew to ~18 GB and macOS compressed the arena itself. With direct reads the arena stays resident and can grow |
+| Purge fix (code): the host code's 6.2 GB of CUDA-shaped weight copies are really released | Footprint before the arena 13.3 → 7.1 GB, resident 11.1 → 8.1 GB. `setPurgeableState(Empty)` had freed nothing: a buffer that has been in the residency set keeps its pages until `release()` |
+| Arena size with the above (decode tok/s / cache hits) | 8.4 GB 24.1 / 0.67; 10.5 GB 26.3 / 0.73; 12.5 GB 28.3 / 0.77; 14 GB 29.3-29.5 / 0.81; 15 GB 30.3-30.6 / 0.82 |
+| 4096-token prompt chunks instead of 2048 (14 GB arena, both runs) | prompts 51.1 → 44.4 s, the 10K-token agent prompt 24.8 → 21.5 s, decode unchanged |
+
+A 17.5 GB ceiling filled 17.5 GB and macOS compressed the new arena during the fill (warning pressure, stopped); 15 GB stayed
+at normal pressure. Not adopted: a file-cache tier for misses (+10% decode, prompts 10-20% slower, compressed other programs),
+queuing read-ahead before misses, reserving I/O threads, 8 I/O threads, read-ahead top 8 (within noise),
+`STRATA_SPEC_COST=1` (it chose 1-token windows: 20 tok/s instead of 28), `--suffix-draft 3` with MTP (28.4 vs 29.5, slower agent
+turns), cache replacement policies other than LRU (simulated on routing traces: capacity matters, policy does not), and kernel
+work (the 4-token window's 1,230 dispatches are a flat profile: the largest class is 7.6%).
+
+The served setup since 2026-11-13: `STRATA_METAL_DIRECT=1 STRATA_METAL_KEEP_WARM=1 STRATA_METAL_REGION_FIT=1
+STRATA_METAL_PROMPT_SMALL=256 STRATA_METAL_PROMPT_CHUNK=4096 STRATA_METAL_ARENA_MAX_GB=15 STRATA_METAL_KEEP_FREE_GB=7
+STRATA_METAL_ARENA_CHUNK_GB=14`, from its own source snapshot (`~/Developer/Strata-iq3s-prod-src`). The arena is sized at
+each load from the memory free then, so a busier Mac gets a smaller one. Runner, plans, raw results and tools:
+`~/Developer/ai-switch/results-iq3s-speed-20261113/`.
+
 
 ## Experimental network expert worker (local source build)
 
