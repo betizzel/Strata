@@ -1,0 +1,4 @@
+[submodule "third_party/llama-pinned"]
+	path = third_party/llama-pinned
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true
