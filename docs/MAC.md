@@ -150,7 +150,7 @@ No production binary/profile was replaced. The 43008 MiB GPU limit is unchanged;
 
 The same IQ3_S target, refusal projection, all ten routed experts, native MTP `--spec 4` with the Q2_0 draft, and 65,536 context.
 Each arm ran a fresh engine on one guarded suite: code, prose, an algorithm, an explanation, a four-turn agent conversation
-(a ~10K-token first prompt, then short tool-result turns) and one request with the production sampling (seeded).
+(a 13K-token first prompt, then short tool-result turns) and one request with the production sampling (seeded).
 The expert file was evicted from the file cache before every arm. Greedy and seeded-sampled outputs were identical across
 all compared arms (`tools/parity.py`; kernel-profiling arms excluded). These are sequential end-to-end measurements on a
 desktop in use, not a long-context or vision benchmark.
@@ -166,7 +166,7 @@ Where a 4-token decode window went at the start (6 GB arena, 140 ms): about 51 m
 | `STRATA_METAL_DIRECT=1`: page-aligned bounce reads | Unaligned `F_NOCACHE` reads left about 35% of the bytes in the file cache; the cache then grew to ~18 GB and macOS compressed the arena itself. With direct reads the arena stays resident and can grow |
 | Purge fix (code): the host code's 6.2 GB of CUDA-shaped weight copies are really released | Footprint before the arena 13.3 → 7.1 GB, resident 11.1 → 8.1 GB. `setPurgeableState(Empty)` had freed nothing: a buffer that has been in the residency set keeps its pages until `release()` |
 | Arena size with the above (decode tok/s / cache hits) | 8.4 GB 24.1 / 0.67; 10.5 GB 26.3 / 0.73; 12.5 GB 28.3 / 0.77; 14 GB 29.3-29.5 / 0.81; 15 GB 30.3-30.6 / 0.82 |
-| 4096-token prompt chunks instead of 2048 (14 GB arena, both runs) | prompts 51.1 → 44.4 s, the 10K-token agent prompt 24.8 → 21.5 s, decode unchanged |
+| 4096-token prompt chunks instead of 2048 (14 GB arena, both runs) | prompts 51.1 → 44.4 s, the 13K-token agent prompt 24.8 → 21.5 s, decode unchanged |
 | `STRATA_METAL_WIRE_ARENA=1`, now wired step by step during the fill (code) | No compression of the fresh arena: first request 3.2-3.5 s instead of up to 14.3 s; 17.5 GB arenas at normal pressure (32.8 tok/s, hits 0.86) |
 
 Unwired, the fresh arena was compressible anonymous memory: in one 15 GB start with 19 GB free, macOS compressed 13.5 GB of
