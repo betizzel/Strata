@@ -4,6 +4,11 @@
 > decode went from 20.1 to 31.4 tok/s with identical tokens. Details: [docs/MAC.md](docs/MAC.md#streaming-speed-work-same-mac-2026-11-13).
 > Files, configuration and setup scripts: [baytizzel/Qwen3.8-Flash-Next-IQ3_S-Strata-M5Pro-48gb](https://huggingface.co/baytizzel/Qwen3.8-Flash-Next-IQ3_S-Strata-M5Pro-48gb)
 > on Hugging Face. Upstream: [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT).
+>
+> **Branch `m5pro-coder`** adds the expert-pruned Qwen3.8-Flash-Next **Coder** IQ1_M (256 experts a layer, upstream's
+> `91411e17`). On the same Mac it decodes 45.8 tok/s in the suite (54.6 on code), with a 64K, 128K or 262K window.
+> Details: [docs/MAC.md](docs/MAC.md#the-coder-iq1_m-256-experts-on-the-same-mac-2026-11-14). Recipe:
+> [baytizzel/Qwen3.8-Flash-Next-Coder-IQ1_M-Strata-M5Pro-48gb](https://huggingface.co/baytizzel/Qwen3.8-Flash-Next-Coder-IQ1_M-Strata-M5Pro-48gb).
 
 <p align="center">
   <picture>

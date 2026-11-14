@@ -190,6 +190,42 @@ service with the image encoder beside it), so a busier Mac gets a smaller one. W
 31.4 tok/s (from 20.05) with 44.5 s of prompts (from 55.5 s), identical tokens. Runner, plans, raw results and tools:
 `~/Developer/ai-switch/results-iq3s-speed-20261113/` (`RESULTS.md`).
 
+### The Coder IQ1_M (256 experts) on the same Mac, 2026-11-14
+
+ISTA-DASLab's GSQ-RCO Coder IQ1_M (29.6 GB first shard, the same 28.8 GB n-gram shard) is expert-pruned to 256 routed
+experts a layer. This branch (`m5pro-coder`) adds upstream's 256-expert Metal support (`91411e17`, cherry-picked; it had
+not been run end to end on such a model before) to the IQ3_S work above, and nothing else changes in the engine.
+
+It runs with the same switches as the IQ3_S service, plus:
+
+- the Coder's own arena profile, `STRATA_METAL_EXPERT_PROFILE=data/expert-profile-coder.bin`. The default profile is
+  for 512 experts, and the stream rejects it for this model;
+- the base model's native MTP head (Q2_0);
+- `--spec 4 --spec-min-p 0.5`.
+
+There is no expert sidecar: missed experts are read from the GGUF in place, in three slices, with direct reads. Same
+suite as above:
+
+| Arena / draft window | Decode tok/s (code) | Cache hits | Engine RSS |
+| --- | --- | --- | --- |
+| 12 GB, `--spec 4` | 32.7 (40.5) | 0.86 | 21.1 GB |
+| 15 GB, `--spec 4` | 37.4 (45.5) | 0.92 | 24.1 GB |
+| 17.5 GB, `--spec 4` | 40.8 (49.7) | 0.95 | 26.6 GB |
+| 20 GB, `--spec 4` | 43.3 (53.5) | 0.97 | 29.1 GB |
+| 20 GB, `--spec 4 --spec-min-p 0.5` | 45.8 (54.6), twice | 0.97 | 29.1 GB |
+| 20 GB, `--spec 3 --spec-min-p 0.5` / `--spec 5 --spec-min-p 0.5` | 45.5 / 44.5 | 0.97 | 29.1 GB |
+
+The same 64K service on llama.cpp (whole model resident) decoded the code request at 44.9 tok/s and drove memory pressure
+to critical with 8% free. Every arm with the same draft settings produced identical tokens, whatever the arena size.
+A different verify window changed one long greedy answer (a near-tie on the 13K-token agent prompt), as with IQ3_S.
+
+Long context, at a 262,144-token window, with needles in the engine's own source asked after the whole text: 119,543
+tokens were read in 174 s (687 tok/s) and 243,977 in 337-367 s (665-675 tok/s). Every needle was found, and a follow-up
+in the 244K conversation reused the cache (1.7 s to its answer). The KV cache costs about 13.7 KB a token: 0.9 GB at
+64K, 1.8 GB at 128K, 3.6 GB at 262K. It is taken at load and comes out of the expert arena when memory is short. The
+served Mac runs the Coder as two services, 64K and 128K, with `STRATA_METAL_ARENA_MAX_GB=20` and `KEEP_FREE_GB=8`.
+Files and setup: [baytizzel/Qwen3.8-Flash-Next-Coder-IQ1_M-Strata-M5Pro-48gb](https://huggingface.co/baytizzel/Qwen3.8-Flash-Next-Coder-IQ1_M-Strata-M5Pro-48gb).
+
 
 ## Experimental network expert worker (local source build)
 
