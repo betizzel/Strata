@@ -168,6 +168,29 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
 
 bool ExpertStream::read(void* dst, uint64_t len, uint64_t off) const {
     uint8_t* p = (uint8_t*) dst;
+    static const bool direct = env_int("STRATA_METAL_DIRECT", 0) != 0;
+    if (direct && ((off | len) & (PAGE - 1)) != 0) {   // whole pages through a bounce buffer (see read_part)
+        const uint64_t win = 64ull << 20;
+        std::vector<uint8_t> raw;
+        while (len > 0) {
+            const uint64_t n = std::min<uint64_t>(len, win);
+            const uint64_t a0 = off / PAGE * PAGE, a1 = (off + n + PAGE - 1) / PAGE * PAGE;
+            if (raw.size() < a1 - a0 + PAGE) raw.resize((size_t) (a1 - a0 + PAGE));
+            uint8_t* bounce = (uint8_t*) (((uintptr_t) raw.data() + PAGE - 1) / PAGE * PAGE);
+            uint64_t got = 0;
+            const uint64_t need = off - a0 + n;   // the widened tail may run past the end of the file
+            while (got < need) {
+                const ssize_t r = ::pread(fd_, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                if (r <= 0) return false;
+                got += (uint64_t) r;
+            }
+            std::memcpy(p, bounce + (off - a0), (size_t) n);
+            p += n;
+            off += n;
+            len -= n;
+        }
+        return true;
+    }
     while (len > 0) {
         const ssize_t r = ::pread(fd_, p, (size_t) std::min<uint64_t>(len, 64ull << 20), (off_t) off);
         if (r <= 0) return false;
@@ -283,6 +306,39 @@ void ExpertStream::read_part(int s, int l, int e, int part) {
         const uint64_t b = part + 1 == split_ ? len : len * (uint64_t) (part + 1) / (uint64_t) split_ / 4096 * 4096;
         uint8_t* p = host_[(size_t) s] + a;
         uint64_t n = b - a, o = src + a;
+        // STRATA_METAL_DIRECT=1 (opt-in): the experts sit back to back in the copy, so most of them start and end inside a
+        // 16 KiB page, and macOS reads such a range through its file cache even with F_NOCACHE (measured on an M5 Pro: 35%
+        // of the bytes read stayed cached) - the stale partial pages then compete with the arena itself, which macOS
+        // compresses instead.  Here the read is widened to whole pages into this thread's bounce buffer (true direct I/O,
+        // nothing cached), and the expert's bytes are copied into the slot.
+        static const bool direct = env_int("STRATA_METAL_DIRECT", 0) != 0;
+        if (direct && ((o | n) & (PAGE - 1)) != 0) {
+            thread_local uint8_t* bounce = nullptr;
+            thread_local uint64_t bounce_cap = 0;
+            const uint64_t a0 = o / PAGE * PAGE, a1 = (o + n + PAGE - 1) / PAGE * PAGE;
+            if (bounce_cap < a1 - a0) {
+                std::free(bounce);
+                void* m = nullptr;
+                if (posix_memalign(&m, PAGE, (size_t) (a1 - a0 + PAGE)) != 0) {
+                    std::fprintf(stderr, "strata metal stream: no memory for a read buffer\n");
+                    std::exit(6);
+                }
+                bounce = (uint8_t*) m;
+                bounce_cap = a1 - a0 + PAGE;
+            }
+            uint64_t got = 0;
+            while (got < o - a0 + n) {   // (the widened tail of the copy's last expert runs past the end of the file)
+                const ssize_t r = ::pread(cfd_, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                if (r <= 0) {
+                    std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
+                    std::exit(6);
+                }
+                got += (uint64_t) r;
+            }
+            std::memcpy(p, bounce + (o - a0), (size_t) n);
+            bytes_read_ += b - a;
+            return;
+        }
         while (n > 0) {
             const ssize_t r = ::pread(cfd_, p, (size_t) n, (off_t) o);
             if (r <= 0) {
@@ -491,6 +547,39 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
     size_t done = 0;
     bool stopped = false;
     uint64_t filled = 0;
+    // Wire the arena (mlock) as it is filled, one fill step at a time.  Unwired, the arena is ordinary anonymous memory
+    // whenever the GPU is not running a command buffer (the GPU's own wiring ends a few seconds after the last one; a Metal
+    // residency set did not hold it either, measured), and macOS compresses it when anything else wants memory: a 20 GB
+    // file written beside the idle engine took tens of GB of the arena into the compressor in seconds and froze the 128 GB
+    // M5 Max (watchdog panic, 2026-10-13).  The experts are incompressible, so compressing them frees almost nothing and the
+    // compressor keeps going: on a 48 GB M5 Pro a 15 GB fill with 19 GB free took 13.5 GB of the just-filled arena into the
+    // compressor in 3 s (the first request then waited 10 s while the GPU wired it back).  Wired step by step, the fill's
+    // memory comes from the file cache and from other programs' compressible pages instead.  Only filled slots are wired: a
+    // fill that stops early leaves the rest untouched.  STRATA_METAL_WIRE_ARENA=0/1; the default is on for a Mac of 64 GB or
+    // more (the M4 32 GB was measured unwired).
+    const bool wire = [&] {
+        uint64_t phys = 0;
+        size_t plen = sizeof phys;
+        sysctlbyname("hw.memsize", &phys, &plen, nullptr, 0);
+        const char* we = std::getenv("STRATA_METAL_WIRE_ARENA");
+        return we && *we ? std::atoi(we) != 0 : (double) phys >= kBigMac;
+    }();
+    std::vector<int> wired_to(next_free);
+    uint64_t pinned = 0;
+    int pin_failed = 0;
+    double pin_ms = 0;
+    auto wire_to = [&](const std::vector<int>& upto) {   // mlock the slots [wired_to, upto) of each class
+        const double tp = now_ms();
+        for (size_t c = 0; c < cls_.size(); ++c) {
+            const uint64_t sz = cls_[c].pages * PAGE;
+            for (int s = wired_to[c]; s < upto[c]; ++s) {
+                if (mlock(host_[(size_t) s], (size_t) sz) == 0) pinned += sz;
+                else ++pin_failed;
+            }
+            wired_to[c] = std::max(wired_to[c], upto[c]);
+        }
+        pin_ms += now_ms() - tp;
+    };
     while (done < fill.size()) {
         size_t j = done;
         uint64_t sb = 0;
@@ -515,6 +604,7 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
         }
         filled += sb;
         done = j;
+        if (wire) wire_to(next_free);
     }
     uint64_t retired_bytes = 0;
     size_t nretired = 0;
@@ -545,30 +635,15 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
                          "profile's top (%zu ranked) in %.1f s (%.2f GB/s); %d I/O threads, read-ahead top %d; %zu buffers\n",
                  (arena_bytes_ - retired_bytes) / 1e9, (unsigned long long) (pairs - nretired), cls_.size(), done, from_profile, fill_s_,
                  fill_bytes_ / 1e9 / std::max(1e-9, fill_s_), nio_, prefetch_ ? pre_k_ : 0, chunks_.size());
-    // Wire the filled arena (mlock).  Unwired, the arena is ordinary anonymous memory whenever the GPU is not running a command buffer
-    // (the GPU's own wiring ends a few seconds after the last one; a Metal residency set did not hold it either, measured), and
-    // macOS compresses it when anything else wants memory: a 20 GB file written beside the idle engine took tens of GB of the arena
-    // into the compressor in seconds and froze the 128 GB M5 Max (watchdog panic, 2026-10-13).  Wired, a file write can only
-    // shrink the file cache.  STRATA_METAL_WIRE_ARENA=0/1; the default is on for a Mac of 64 GB or more (the M4 32 GB was measured
-    // unwired).  Not when the fill stopped early for lack of memory (the unused slots would be wired too).
-    {
-        uint64_t phys = 0;
-        size_t plen = sizeof phys;
-        sysctlbyname("hw.memsize", &phys, &plen, nullptr, 0);
-        const char* we = std::getenv("STRATA_METAL_WIRE_ARENA");
-        const bool want = we && *we ? std::atoi(we) != 0 : (double) phys >= kBigMac;
-        if (want && !stopped) {
-            const double tp = now_ms();
-            uint64_t pinned = 0;
-            int failed = 0;
-            for (const auto& c : chunks_) {
-                if (mlock(c.ptr, c.bytes) == 0) pinned += c.bytes;
-                else ++failed;
-            }
-            std::fprintf(stderr, "strata metal stream: %.1f GB of the arena wired (mlock) in %.0f ms%s; macOS cannot compress it while "
-                                 "the engine idles (STRATA_METAL_WIRE_ARENA=0 turns it off)\n", pinned / 1e9, now_ms() - tp,
-                         failed ? "; SOME CHUNKS COULD NOT BE WIRED" : "");
+    if (wire) {
+        if (!stopped) {   // slots the profile left empty (fewer ranked pairs than slots): the planned arena, wired too
+            std::vector<int> ends(cls_.size());
+            for (size_t c = 0; c < cls_.size(); ++c) ends[c] = cls_[c].base + cls_[c].n;
+            wire_to(ends);
         }
+        std::fprintf(stderr, "strata metal stream: %.1f GB of the arena wired (mlock) as it was filled, %.0f ms%s; macOS cannot "
+                             "compress it (STRATA_METAL_WIRE_ARENA=0 turns it off)\n", pinned / 1e9, pin_ms,
+                     pin_failed ? "; SOME SLOTS COULD NOT BE WIRED" : "");
     }
     (void) err;
     return true;

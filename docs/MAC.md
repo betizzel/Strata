@@ -63,8 +63,9 @@ The engine streams the experts from the SSD. It decides this itself when the exp
   of the RAM when that is more), whichever is smaller. It counts as free only what macOS can give without swapping, fills the
   arena in 1.5 GB steps and stops early rather than push macOS below its reserve.
 - On a Mac with 64 GB or more, the arena, the Metal buffers and the host memory together stay under 60% of the RAM, and the
-  filled arena is wired (`mlock`) so macOS does not compress it while the GPU is idle. `STRATA_METAL_WIRE_ARENA=0` turns the
-  wiring off. `STRATA_METAL_ARENA_GB` sets the arena yourself, with a warning when it is over the cap. The engine prints the
+  arena is wired (`mlock`) step by step as it is filled, so macOS does not compress it during the fill or while the GPU is idle.
+  `STRATA_METAL_WIRE_ARENA=0` turns the wiring off; `=1` turns it on for a smaller Mac (a 48 GB M5 Pro runs well with it).
+  `STRATA_METAL_ARENA_GB` sets the arena yourself, with a warning when it is over the cap. The engine prints the
   planned footprint (`planned resident footprint ... cap ...`) and the footprint after the fill.
 - Setup writes a second copy of the experts (`<model>.experts`, 40 GB for IQ3_XXS) in which each expert's three matrices sit
   together, so the SSD reads an expert with one request. On the 32 GB M4 that is about 17% faster decoding and 30% faster prompts
@@ -262,9 +263,10 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_PROMPT_EXPERTS=v3` | The M5 layout for the prompt's expert GEMMs. Fails on an M1 Max, so it is off there (default v2) |
 | `STRATA_METAL_STREAM=1` / `=0` | Stream the experts from the SSD even when the pack fits / never (the default decides by size) |
 | `STRATA_METAL_CONTIG=0` | Streaming: read the model file even when the experts' copy is there |
+| `STRATA_METAL_DIRECT=1` | Streaming: read each expert as whole pages into a per-thread buffer and copy it into its slot, so nothing lands in macOS's file cache (an unaligned `F_NOCACHE` read still keeps its partial pages cached: about 35% of the bytes, measured on an M5 Pro) |
 | `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: the arena's size, or the memory left to macOS |
 | `STRATA_METAL_LEAVE_SHARE=0.4` | Streaming, 64 GB or more: the share of the RAM left to macOS when the footprint cap is set |
-| `STRATA_METAL_WIRE_ARENA=0` | Streaming, 64 GB or more: leave the filled arena pageable (default: wired) |
+| `STRATA_METAL_WIRE_ARENA=0` / `=1` | Streaming: leave the arena pageable / wire it as it is filled (default: wired on 64 GB or more) |
 | `STRATA_METAL_IGNORE_REPACK=1` | Start although a model repack or setup's preparation is running (the engine refuses by default) |
 | `STRATA_METAL_KEEP_HOST_WEIGHTS=1` | Streaming: keep the host code's own copies of the weights (2 to 3 GB) |
 | `STRATA_METAL_F16=1` / `=0` | Decode windows of a resident model: the GEMVs of Q2_0, Q3_K-Q6_K and IQ4_XS and the Q2_0 routed experts in fp16. On in the config setup writes for a resident IQ3_S or Q2_0 pack (M5 Max: decode +9 to +15%, top-1 96-97% and mean KL 0.009-0.016 against fp32; the 61-task quality suite passes the same tasks as with it off); `=0` in the config's `env` turns it off. Other sets: off unless set. M1 Max: a 2-token window's GPU time 56-60 -> 40-41 ms, mean KL 0.009 against fp32 |
