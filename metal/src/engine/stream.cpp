@@ -186,6 +186,29 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
 
 bool ExpertStream::read(void* dst, uint64_t len, uint64_t off) const {
     uint8_t* p = (uint8_t*) dst;
+    static const bool direct = env_int("STRATA_METAL_DIRECT", 0) != 0;
+    if (direct && ((off | len) & (PAGE - 1)) != 0) {   // whole pages through a bounce buffer (see read_part)
+        const uint64_t win = 64ull << 20;
+        std::vector<uint8_t> raw;
+        while (len > 0) {
+            const uint64_t n = std::min<uint64_t>(len, win);
+            const uint64_t a0 = off / PAGE * PAGE, a1 = (off + n + PAGE - 1) / PAGE * PAGE;
+            if (raw.size() < a1 - a0 + PAGE) raw.resize((size_t) (a1 - a0 + PAGE));
+            uint8_t* bounce = (uint8_t*) (((uintptr_t) raw.data() + PAGE - 1) / PAGE * PAGE);
+            uint64_t got = 0;
+            const uint64_t need = off - a0 + n;   // the widened tail may run past the end of the file
+            while (got < need) {
+                const ssize_t r = ::pread(fd_, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                if (r <= 0) return false;
+                got += (uint64_t) r;
+            }
+            std::memcpy(p, bounce + (off - a0), (size_t) n);
+            p += n;
+            off += n;
+            len -= n;
+        }
+        return true;
+    }
     while (len > 0) {
         const ssize_t r = ::pread(fd_, p, (size_t) std::min<uint64_t>(len, 64ull << 20), (off_t) off);
         if (r <= 0) return false;
@@ -302,6 +325,39 @@ void ExpertStream::read_part(int s, int l, int e, int part, bool cache) {
         const uint64_t b = part + 1 == split_ ? len : len * (uint64_t) (part + 1) / (uint64_t) split_ / 4096 * 4096;
         uint8_t* p = host_[(size_t) s] + a;
         uint64_t n = b - a, o = src + a;
+        // STRATA_METAL_DIRECT=1 (opt-in): the experts sit back to back in the copy, so most of them start and end inside a
+        // 16 KiB page, and macOS reads such a range through its file cache even with F_NOCACHE (measured: 35% of the bytes
+        // read stayed cached) - the stale partial pages then compete with the arena itself, which macOS compresses
+        // instead.  Here the read is widened to whole pages into this thread's bounce buffer (true direct I/O, nothing
+        // cached), and the expert's bytes are copied into the slot.
+        static const bool direct = env_int("STRATA_METAL_DIRECT", 0) != 0;
+        if (direct && fd == cfd_ && ((o | n) & (PAGE - 1)) != 0) {
+            thread_local uint8_t* bounce = nullptr;
+            thread_local uint64_t bounce_cap = 0;
+            const uint64_t a0 = o / PAGE * PAGE, a1 = (o + n + PAGE - 1) / PAGE * PAGE;
+            if (bounce_cap < a1 - a0) {
+                std::free(bounce);
+                void* m = nullptr;
+                if (posix_memalign(&m, PAGE, (size_t) (a1 - a0 + PAGE)) != 0) {
+                    std::fprintf(stderr, "strata metal stream: no memory for a read buffer\n");
+                    std::exit(6);
+                }
+                bounce = (uint8_t*) m;
+                bounce_cap = a1 - a0 + PAGE;
+            }
+            uint64_t got = 0;
+            while (got < o - a0 + n) {   // (the widened tail of the copy's last expert runs past the end of the file)
+                const ssize_t r = ::pread(fd, bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                if (r <= 0) {
+                    std::fprintf(stderr, "strata metal stream: reading expert %d of layer %d failed\n", e, l);
+                    std::exit(6);
+                }
+                got += (uint64_t) r;
+            }
+            std::memcpy(p, bounce + (o - a0), (size_t) n);
+            bytes_read_ += b - a;
+            return;
+        }
         while (n > 0) {
             const ssize_t r = ::pread(fd, p, (size_t) n, (off_t) o);
             if (r <= 0) {
