@@ -7337,6 +7337,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path in ("/tokenize", "/v1/tokenize"):
+                    self._tokenize(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
@@ -7902,6 +7904,16 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+
+        def _tokenize(self, req):
+            """Plain text to token ids with the model's tokenizer, as vLLM's and SGLang's /tokenize answer it: no chat
+            template, special tokens left as text. Benchmarks count a streamed answer's tokens with it; the model does
+            not run."""
+            text = req.get("prompt", req.get("content"))
+            if not isinstance(text, str):
+                raise ValueError('send {"prompt": "<text>"} (or "content")')
+            ids = svc.tok.encode(text)
+            self._json(200, {"tokens": ids, "count": len(ids), "max_model_len": svc.reported_ctx()})
 
         def _anthropic(self, req):
             svc.load()
